@@ -3,7 +3,7 @@ from discord.ext import commands
 import asyncio
 import subprocess
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import shlex
 import logging
 import shutil
@@ -14,17 +14,75 @@ import time
 import sqlite3
 import random
 import requests
+import string
+import secrets
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Load environment variables
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', 'MTU0OTM4ODAwNTIyMjEyMTU1Mw.GL936g.fTa9c06lGAOPPXsTYt9dZs-n06t0gWjxqdjs6s')
-BOT_NAME = os.getenv('BOT_NAME', '亗 RyzenCloud VMS 亗')
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+BOT_NAME = os.getenv('BOT_NAME', 'PapiaGamerz VMS')
 PREFIX = os.getenv('PREFIX', '!')
-YOUR_SERVER_IP = os.getenv('YOUR_SERVER_IP', '127.0.0.1')
-MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID', '1459810367013126185'))
-VPS_USER_ROLE_ID = int(os.getenv('VPS_USER_ROLE_ID', '1459810367013126185'))
+YOUR_SERVER_IP = os.getenv('YOUR_SERVER_IP')
+MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID', '1210291131301101618'))
+VPS_USER_ROLE_ID = int(os.getenv('VPS_USER_ROLE_ID', '1210291131301101618'))
 DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', 'default')
-BOT_VERSION = os.getenv('BOT_VERSION', '7.0-PRO')
-BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'ItzRiyad20')
+HOST_MOTD = os.getenv('HOST_MOTD', '')
+BOT_VERSION = os.getenv('BOT_VERSION', '8.0-PRO')
+BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'PapiaGamerz')
+BOT_THUMBNAIL_URL = os.getenv('BOT_THUMBNAIL_URL', 'https://i.imgur.com/Tv3clt0.jpeg')
+BOT_ICON_URL = os.getenv('BOT_ICON_URL', 'https://i.imgur.com/Tv3clt0.jpeg')
+
+# VPS Expiration Settings
+DEFAULT_VPS_EXPIRATION_DAYS = int(os.getenv('DEFAULT_VPS_EXPIRATION_DAYS', '30'))
+EXPIRATION_WARNING_DAYS = int(os.getenv('EXPIRATION_WARNING_DAYS', '1'))
+
+# !deploy command — members with DEPLOY_ROLE_ID get free VPS instantly
+# Set these in your .env file:
+#   DEPLOY_ROLE_ID=<discord_role_id>   (the member role that can use !deploy)
+#   DEPLOY_RAM=16                       (GB of RAM per deployed VPS)
+#   DEPLOY_CPU=3                        (CPU cores per deployed VPS)
+#   DEPLOY_DISK=80                      (GB disk per deployed VPS)
+#   VPS_DEPLOY_LIMIT=2                  (max VPS per user via !deploy — users cannot create more than this)
+#   DEPLOY_SLOT=2                       (total global VPS slot cap across ALL users, 0 = unlimited)
+DEPLOY_ROLE_ID = int(os.getenv('DEPLOY_ROLE_ID', '0'))
+DEPLOY_RAM     = int(os.getenv('DEPLOY_RAM',  '16'))
+DEPLOY_CPU     = int(os.getenv('DEPLOY_CPU',  '3'))
+DEPLOY_DISK    = int(os.getenv('DEPLOY_DISK', '80'))
+# VPS_DEPLOY_LIMIT = max VPS a single user can create via !deploy
+# Supports both VPS_DEPLOY_LIMIT (new) and DEPLOY_LIMIT (old) — VPS_DEPLOY_LIMIT takes priority
+DEPLOY_LIMIT   = int(os.getenv('VPS_DEPLOY_LIMIT', os.getenv('DEPLOY_LIMIT', '2')))
+DEPLOY_SLOT    = int(os.getenv('DEPLOY_SLOT', '0'))
+
+# SSH Configuration
+SSH_FIX_SCRIPT = """#!/bin/bash
+cat > /etc/ssh/sshd_config << 'SSHEOF'
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM yes
+MaxAuthTries 6
+MaxSessions 10
+SyslogFacility AUTH
+LogLevel INFO
+X11Forwarding yes
+X11DisplayOffset 10
+PrintMotd no
+PrintLastLog yes
+TCPKeepAlive yes
+PermitUserEnvironment no
+Subsystem sftp /usr/lib/openssh/sftp-server
+SSHEOF
+systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || /etc/init.d/ssh restart 2>/dev/null || true
+"""
 
 # OS Options for VPS Creation and Reinstall
 OS_OPTIONS = [
@@ -92,7 +150,9 @@ def init_db():
         whitelisted INTEGER DEFAULT 0,
         created_at TEXT NOT NULL,
         shared_with TEXT DEFAULT '[]',
-        suspension_history TEXT DEFAULT '[]'
+        suspension_history TEXT DEFAULT '[]',
+        expiration_date TEXT DEFAULT NULL,
+        root_password TEXT DEFAULT NULL
     )''')
     # Migrations
     cur.execute('PRAGMA table_info(vps)')
@@ -102,6 +162,10 @@ def init_db():
         cur.execute("ALTER TABLE vps ADD COLUMN os_version TEXT DEFAULT 'ubuntu:22.04'")
     if 'node_id' not in columns:
         cur.execute("ALTER TABLE vps ADD COLUMN node_id INTEGER DEFAULT 1")
+    if 'expiration_date' not in columns:
+        cur.execute("ALTER TABLE vps ADD COLUMN expiration_date TEXT DEFAULT NULL")
+    if 'root_password' not in columns:
+        cur.execute("ALTER TABLE vps ADD COLUMN root_password TEXT DEFAULT NULL")
     cur.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -151,6 +215,8 @@ def get_nodes() -> List[Dict]:
     nodes = [dict(row) for row in rows]
     for node in nodes:
         node['tags'] = json.loads(node['tags'])
+        # Ensure is_local is properly converted
+        node['is_local'] = int(node.get('is_local', 1)) == 1
     return nodes
 
 def get_node(node_id: int) -> Optional[Dict]:
@@ -162,7 +228,26 @@ def get_node(node_id: int) -> Optional[Dict]:
     if row:
         node = dict(row)
         node['tags'] = json.loads(node['tags'])
+        # Ensure is_local is properly converted
+        node['is_local'] = int(node.get('is_local', 1)) == 1
         return node
+    return None
+
+def get_vps_by_id(vps_id: int) -> Optional[Dict]:
+    """Get VPS info by global VPS ID"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM vps WHERE id = ?', (vps_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        vps = dict(row)
+        vps['shared_with'] = json.loads(vps.get('shared_with', '[]'))
+        vps['suspension_history'] = json.loads(vps.get('suspension_history', '[]'))
+        vps['suspended'] = bool(vps.get('suspended', 0))
+        vps['whitelisted'] = bool(vps.get('whitelisted', 0))
+        vps['os_version'] = vps.get('os_version', 'ubuntu:22.04')
+        return vps
     return None
 
 def get_current_vps_count(node_id: int) -> int:
@@ -202,29 +287,49 @@ def get_admins() -> List[str]:
     return [row['user_id'] for row in rows]
 
 def save_vps_data():
+    """Persist in-memory vps_data to SQLite via safe UPSERT.
+    Never deletes rows — deletion is handled explicitly by delete commands.
+    This prevents data loss on restart/reconnect race conditions.
+    """
+    if not vps_data:
+        return  # Nothing to save; don't wipe the DB
     conn = get_db()
     cur = conn.cursor()
     for user_id, vps_list in vps_data.items():
         for vps in vps_list:
-            shared_json = json.dumps(vps['shared_with'])
-            history_json = json.dumps(vps['suspension_history'])
-            suspended_int = 1 if vps['suspended'] else 0
+            shared_json = json.dumps(vps.get('shared_with', []))
+            history_json = json.dumps(vps.get('suspension_history', []))
+            suspended_int = 1 if vps.get('suspended') else 0
             whitelisted_int = 1 if vps.get('whitelisted', False) else 0
             os_ver = vps.get('os_version', 'ubuntu:22.04')
             created_at = vps.get('created_at', datetime.now().isoformat())
             node_id = vps.get('node_id', 1)
+            expiration_date = vps.get('expiration_date', None)
+            root_password = vps.get('root_password', None)
+            status = vps.get('status', 'stopped')
             if 'id' not in vps or vps['id'] is None:
-                cur.execute('''INSERT INTO vps (user_id, node_id, container_name, ram, cpu, storage, config, os_version, status, suspended, whitelisted, created_at, shared_with, suspension_history)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                            (user_id, node_id, vps['container_name'], vps['ram'], vps['cpu'], vps['storage'], vps['config'],
-                             os_ver, vps['status'], suspended_int, whitelisted_int,
-                             created_at, shared_json, history_json))
+                cur.execute(
+                    '''INSERT OR IGNORE INTO vps
+                       (user_id, node_id, container_name, ram, cpu, storage, config,
+                        os_version, status, suspended, whitelisted, created_at,
+                        shared_with, suspension_history, expiration_date, root_password)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (user_id, node_id, vps['container_name'], vps['ram'], vps['cpu'],
+                     vps['storage'], vps['config'], os_ver, status,
+                     suspended_int, whitelisted_int, created_at,
+                     shared_json, history_json, expiration_date, root_password))
                 vps['id'] = cur.lastrowid
             else:
-                cur.execute('''UPDATE vps SET user_id = ?, node_id = ?, container_name = ?, ram = ?, cpu = ?, storage = ?, config = ?, os_version = ?, status = ?, suspended = ?, whitelisted = ?, shared_with = ?, suspension_history = ?
-                               WHERE id = ?''',
-                            (user_id, node_id, vps['container_name'], vps['ram'], vps['cpu'], vps['storage'], vps['config'],
-                             os_ver, vps['status'], suspended_int, whitelisted_int, shared_json, history_json, vps['id']))
+                cur.execute(
+                    '''UPDATE vps SET user_id=?, node_id=?, container_name=?, ram=?, cpu=?,
+                       storage=?, config=?, os_version=?, status=?, suspended=?,
+                       whitelisted=?, shared_with=?, suspension_history=?,
+                       expiration_date=?, root_password=?
+                       WHERE id=?''',
+                    (user_id, node_id, vps['container_name'], vps['ram'], vps['cpu'],
+                     vps['storage'], vps['config'], os_ver, status,
+                     suspended_int, whitelisted_int, shared_json, history_json,
+                     expiration_date, root_password, vps['id']))
     conn.commit()
     conn.close()
 
@@ -363,6 +468,57 @@ init_db()
 vps_data = get_vps_data()
 admin_data = {'admins': get_admins()}
 
+# Auto-save flag to prevent constant file writes
+_auto_save_pending = False
+
+def mark_for_save():
+    """Mark data for auto-save"""
+    global _auto_save_pending
+    _auto_save_pending = True
+
+async def auto_save_task():
+    """Background task to auto-save VPS data periodically"""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            global _auto_save_pending
+            if _auto_save_pending:
+                save_vps_data()
+                _auto_save_pending = False
+                logger.debug("Auto-saved VPS data")
+        except Exception as e:
+            logger.error(f"Error in auto-save task: {e}")
+        await asyncio.sleep(2)  # Check every 2 seconds
+
+async def rotating_presence_task():
+    """Background task to update bot watching status with VPS stats"""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now = datetime.now()
+            total = running = expired = 0
+            for user_vps_list in vps_data.values():
+                for vps in user_vps_list:
+                    total += 1
+                    if vps.get('status') == 'running' and not vps.get('suspended'):
+                        running += 1
+                    exp = vps.get('expiration_date')
+                    if exp and datetime.fromisoformat(exp) < now:
+                        expired += 1
+            slot_cap = DEPLOY_SLOT if DEPLOY_SLOT > 0 else 100
+            status_name = f"🖥️ {total}/{slot_cap} VPS | 🟢 {running} Running | 🔴 {expired} Expired"
+            await bot.change_presence(
+                activity=discord.Activity(type=discord.ActivityType.watching, name=status_name)
+            )
+        except Exception as e:
+            logger.error(f"Error in presence task: {e}")
+        await asyncio.sleep(30)
+
+def save_vps_data_immediate():
+    """Immediate save - call this for critical operations"""
+    save_vps_data()
+    mark_for_save()  # Ensure it's saved
+
 # Global settings from DB
 CPU_THRESHOLD = int(get_setting('cpu_threshold', 90))
 RAM_THRESHOLD = int(get_setting('ram_threshold', 90))
@@ -376,6 +532,22 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # Resource monitoring settings (logging only)
 resource_monitor_active = True
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MODERN UI/UX SYSTEM - Beautiful Discord Embeds
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Professional Color Palette
+COLOR_PRIMARY = 0x2c3e50      # Dark slate blue
+COLOR_SUCCESS = 0x27ae60      # Modern green  
+COLOR_ERROR = 0xe74c3c        # Bright red
+COLOR_WARNING = 0xf39c12      # Amber
+COLOR_INFO = 0x3498db         # Ocean blue
+COLOR_NETWORK = 0x16a085      # Teal
+COLOR_EXPIRED = 0xc0392b      # Dark red
+COLOR_ACTIVE = 0x16a085       # Teal green
+COLOR_SUSPENDED = 0x95a5a6    # Gray
+COLOR_NODE = 0x8e44ad         # Purple
+
 # Helper function to truncate text
 def truncate_text(text, max_length=1024):
     if not text:
@@ -384,37 +556,197 @@ def truncate_text(text, max_length=1024):
         return text
     return text[:max_length-3] + "..."
 
-# Embed creation functions
-def create_embed(title, description="", color=0x1a1a1a):
+# Password generation and management functions
+def generate_strong_password(length=16):
+    """Generate a cryptographically strong password"""
+    # Use mix of uppercase, lowercase, digits, and special characters
+    charset = string.ascii_letters + string.digits + "!@#$%^&*"
+    password = ''.join(secrets.choice(charset) for _ in range(length))
+    return password
+
+def sanitize_username_for_container(username: str) -> str:
+    """
+    Sanitize username for LXC container naming.
+    LXC only allows alphanumeric and hyphen characters.
+    Replace underscores, spaces, and other invalid chars with hyphens.
+    """
+    # Replace underscores and spaces with hyphens
+    sanitized = username.replace('_', '-').replace(' ', '-')
+    # Remove any character that's not alphanumeric or hyphen
+    sanitized = ''.join(c for c in sanitized if c.isalnum() or c == '-')
+    # Ensure it doesn't start or end with hyphen (LXC requirement)
+    sanitized = sanitized.strip('-').lower()
+    # Limit length to avoid issues (LXC container names have limits)
+    sanitized = sanitized[:30]
+    return sanitized
+
+def get_vps_password(container_name):
+    """Get password from VPS data"""
+    for user_id, vps_list in vps_data.items():
+        for vps in vps_list:
+            if vps['container_name'] == container_name:
+                return vps.get('root_password', None)
+    return None
+
+def set_vps_password(container_name, password):
+    """Set password for VPS"""
+    for user_id, vps_list in vps_data.items():
+        for vps in vps_list:
+            if vps['container_name'] == container_name:
+                vps['root_password'] = password
+                save_vps_data_immediate()
+                return True
+    return False
+
+async def configure_ssh(container_name, node_id, password):
+    """Configure SSH on VPS and set root password"""
+    try:
+        # Simple SSH configuration commands
+        ssh_config_content = """Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM yes
+MaxAuthTries 6
+MaxSessions 10
+SyslogFacility AUTH
+LogLevel INFO
+X11Forwarding yes
+X11DisplayOffset 10
+PrintMotd no
+PrintLastLog yes
+TCPKeepAlive yes
+PermitUserEnvironment no
+Subsystem sftp /usr/lib/openssh/sftp-server"""
+
+        # Create SSH config using Python string, escaping properly
+        config_cmd = ssh_config_content.replace('\n', '\\n')
+        
+        # Apply SSH configuration
+        await execute_lxc(container_name, 
+            f'exec {container_name} -- bash -c "echo -e \\"{config_cmd}\\" > /etc/ssh/sshd_config"',
+            node_id=node_id)
+        logger.info(f"SSH config file written on {container_name}")
+        
+        # Restart SSH service with multiple fallbacks
+        restart_cmd = "systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || /etc/init.d/ssh restart 2>/dev/null || true"
+        await execute_lxc(container_name,
+            f'exec {container_name} -- bash -c "{restart_cmd}"',
+            node_id=node_id)
+        logger.info(f"SSH service restarted on {container_name}")
+        
+        # Set root password using chpasswd (non-interactive and reliable)
+        await execute_lxc(container_name,
+            f"exec {container_name} -- bash -c \"echo 'root:{password}' | chpasswd\"",
+            node_id=node_id)
+        logger.info(f"Root password set for {container_name}")
+        
+        # Store password
+        set_vps_password(container_name, password)
+        return True, password
+    except Exception as e:
+        logger.error(f"Failed to configure SSH for {container_name}: {e}")
+        return False, str(e)
+
+def truncate_text(text, max_length=1024):
+    if not text:
+        return text
+    if len(text) <= max_length:
+        return text
+    return text[:max_length-3] + "..."
+
+# Create professional embeds with modern styling
+def create_embed(title, description="", color=COLOR_PRIMARY):
+    """Create a beautiful, modern embed"""
     embed = discord.Embed(
-        title=truncate_text(f"🌟 {BOT_NAME} - {title}", 256),
+        title=f"🌟 {title}",
         description=truncate_text(description, 4096),
         color=color
     )
-    embed.set_thumbnail(url="https://i.imgur.com/Tv3clt0.jpeg")
-    embed.set_footer(text=f"{BOT_NAME} VPS Manager v{BOT_VERSION} • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                     icon_url="https://i.imgur.com/Tv3clt0.jpeg")
+    embed.set_thumbnail(url=BOT_THUMBNAIL_URL)
+    embed.set_footer(
+        text=f"Made by Hopingboyz • v{BOT_VERSION} • {datetime.now().strftime('%H:%M:%S')}",
+        icon_url=BOT_ICON_URL
+    )
+    embed.timestamp = datetime.now()
     return embed
 
 def add_field(embed, name, value, inline=False):
+    """Add a field with professional formatting"""
     embed.add_field(
-        name=truncate_text(f"▸ {name}", 256),
+        name=f"➤ {name}",
         value=truncate_text(value, 1024),
         inline=inline
     )
     return embed
 
 def create_success_embed(title, description=""):
-    return create_embed(title, description, color=0x00ff88)
+    """Create a success embed (green)"""
+    return create_embed(title, description, COLOR_SUCCESS)
 
 def create_error_embed(title, description=""):
-    return create_embed(title, description, color=0xff3366)
+    """Create an error embed (red)"""
+    return create_embed(title, description, COLOR_ERROR)
 
 def create_info_embed(title, description=""):
-    return create_embed(title, description, color=0x00ccff)
+    """Create an info embed (blue)"""
+    return create_embed(title, description, COLOR_INFO)
 
 def create_warning_embed(title, description=""):
-    return create_embed(title, description, color=0xffaa00)
+    """Create a warning embed (orange)"""
+    return create_embed(title, description, COLOR_WARNING)
+
+# Visual helper functions
+def create_progress_bar(value, max_value=100, length=15):
+    """Create a visual progress bar with emoji blocks"""
+    if max_value == 0:
+        percentage = 0
+    else:
+        percentage = int((value / max_value) * 100)
+    filled = int((percentage / 100) * length)
+    bar = "🟩" * filled + "⬜" * (length - filled)
+    return f"{bar} `{percentage}%`"
+
+def format_expiration(vps):
+    """Format expiration date with visual badge"""
+    if not vps.get('expiration_date'):
+        return "🔵 No expiration"
+    
+    exp_dt = datetime.fromisoformat(vps['expiration_date'])
+    days = (exp_dt - datetime.now()).days
+    
+    if days < 0:
+        return f"🔴 **EXPIRED** (`{abs(days)}d ago`)"
+    elif days <= EXPIRATION_WARNING_DAYS:
+        return f"🟡 **EXPIRING** (`{days}d left`)"
+    else:
+        return f"🟢 **ACTIVE** (`{days}d left`)"
+
+def create_vps_card(vps, index):
+    """Create a formatted VPS information card"""
+    node = get_node(vps.get('node_id', 1))
+    status_emoji = "🟢" if (vps.get('status') == 'running' and not vps.get('suspended')) else "🟡" if vps.get('suspended') else "🔴"
+    node_emoji = "📍" if (node and node.get('is_local')) else "🌐"
+    
+    card = (
+        f"**#{index}** `{vps['container_name']}`\n"
+        f"{status_emoji} {vps.get('status', 'unknown').upper()}"
+    )
+    if vps.get('suspended'):
+        card += " (SUSPENDED)"
+    
+    card += (
+        f"\n⚙️ **Config:** {vps.get('config', 'Custom')}\n"
+        f"💾 **RAM:** {vps['ram']} | **CPU:** {vps['cpu']} | **Disk:** {vps['storage']}\n"
+        f"{node_emoji} **Node:** {node['name'] if node else 'Unknown'}\n"
+        f"⏰ **Expiration:** {format_expiration(vps)}"
+    )
+    return card
 
 # Admin checks
 def is_admin():
@@ -443,6 +775,7 @@ async def execute_lxc(container_name: str, command: str, timeout=120, node_id: O
     
     full_command = f"lxc {command}"
     
+    # is_local is already boolean from get_node()
     if node['is_local']:
         try:
             cmd = shlex.split(full_command)
@@ -470,40 +803,52 @@ async def execute_lxc(container_name: str, command: str, timeout=120, node_id: O
             logger.error(f"LXC Error: {full_command} - {str(e)}")
             raise
     else:
+        # Use Remote Node API - handle unreachable nodes gracefully with proper error reporting
         url = f"{node['url']}/api/execute"
         data = {"command": full_command}
         params = {"api_key": node["api_key"]}
         try:
             response = requests.post(url, json=data, params=params, timeout=timeout)
             
-            # Try to get detailed error information
-            try:
-                error_detail = response.json()
-                if 'detail' in error_detail:
-                    error_msg = error_detail['detail']
-                elif 'error' in error_detail:
-                    error_msg = error_detail['error']
-                else:
-                    error_msg = response.text
-            except:
-                error_msg = response.text
+            # Check for HTTP errors first
+            if response.status_code != 200:
+                error_msg = f"HTTP {response.status_code}"
+                try:
+                    error_detail = response.json()
+                    if 'detail' in error_detail:
+                        error_msg = error_detail['detail']
+                    elif 'error' in error_detail:
+                        error_msg = error_detail['error']
+                    elif 'stderr' in error_detail:
+                        error_msg = error_detail['stderr']
+                except:
+                    pass
+                raise Exception(f"Remote execution failed on {node['name']}: {error_msg}\nCommand: {full_command}")
             
-            response.raise_for_status()
-            
+            # Parse successful response
             res = response.json()
             if res.get("returncode", 1) != 0:
                 stderr = res.get("stderr", "Command failed")
-                # Add more context to remote error
+                logger.warning(f"Remote command failed on node {node['name']}: {stderr}")
                 raise Exception(f"Remote LXC command failed on {node['name']}: {stderr}\nCommand: {full_command}")
+            
             return res.get("stdout", True)
             
+        except requests.exceptions.ConnectionError as ce:
+            # Network error - node is unreachable (log as debug to avoid spam)
+            logger.debug(f"Node {node['name']} unreachable at {node['url']} - network connection failed")
+            raise Exception(f"Node {node['name']} is unreachable (network error). The remote node may be offline.")
+        except requests.exceptions.Timeout:
+            # Timeout error
+            logger.warning(f"Remote execution timed out on node {node['name']}")
+            raise Exception(f"Remote execution timed out on {node['name']} (timeout after {timeout}s)")
         except requests.exceptions.RequestException as e:
-            logger.error(f"Remote LXC error on node {node['name']} ({url}): {str(e)}")
-            # Include URL and status code if available
-            if hasattr(e.response, 'status_code'):
-                raise Exception(f"Remote execution failed on {node['name']}: HTTP {e.response.status_code} - {str(e)}")
-            else:
-                raise Exception(f"Remote execution failed on {node['name']}: {str(e)}")
+            # Other request errors
+            logger.warning(f"Remote execution error on node {node['name']}: {str(e)}")
+            raise Exception(f"Remote execution failed on {node['name']}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error executing command on node {node['name']}: {str(e)}")
+            raise
 
 # Apply LXC config
 async def apply_lxc_config(container_name: str, node_id: int):
@@ -512,11 +857,7 @@ async def apply_lxc_config(container_name: str, node_id: int):
         await execute_lxc(container_name, f"config set {container_name} security.privileged true", node_id=node_id)
         await execute_lxc(container_name, f"config set {container_name} security.syscalls.intercept.mknod true", node_id=node_id)
         await execute_lxc(container_name, f"config set {container_name} security.syscalls.intercept.setxattr true", node_id=node_id)
-        await execute_lxc(container_name, f"config set {container_name} linux.kernel_modules overlay,loop,nf_nat,ip_tables,ip6_tables,netlink_diag,br_netfilter", node_id=node_id)
-        try:
-            await execute_lxc(container_name, f"config device add {container_name} fuse unix-char path=/dev/fuse", node_id=node_id)
-        except:
-            pass
+        await execute_lxc(container_name, f"config set {container_name} linux.kernel_modules overlay,loop,nf_nat,ip_tables,ip6_tables,br_netfilter", node_id=node_id)
         raw_lxc_config = (
             "lxc.apparmor.profile = unconfined\n"
             "lxc.apparmor.allow_nesting = 1\n"
@@ -527,10 +868,30 @@ async def apply_lxc_config(container_name: str, node_id: int):
             "lxc.cgroup2.devices.allow = a\n"
             "\n"
             "lxc.mount.auto = proc:rw sys:rw cgroup:rw shmounts:rw\n"
-            "\n"
-            "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n"
         )
-        await execute_lxc(container_name, f"config set {container_name} raw.lxc '{raw_lxc_config}'", node_id=node_id)
+        # Use stdin pipe to set raw.lxc — avoids shlex.split() mangling the
+        # multiline value when it's embedded directly in the command string.
+        node = get_node(node_id)
+        if node and node['is_local']:
+            proc = await asyncio.create_subprocess_exec(
+                "lxc", "config", "set", container_name, "raw.lxc", "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=raw_lxc_config.encode()), timeout=30
+            )
+            if proc.returncode != 0:
+                raise Exception(f"Failed to set raw.lxc: {stderr.decode().strip()}")
+        else:
+            # Remote node: send as a single-line escaped value via the existing API
+            escaped = raw_lxc_config.replace("\n", "\\n")
+            await execute_lxc(
+                container_name,
+                f"config set {container_name} raw.lxc {escaped!r}",
+                node_id=node_id,
+            )
         logger.info(f"LXC permissions applied to {container_name} on node {node_id}")
     except Exception as e:
         logger.error(f"Failed to apply LXC config to {container_name}: {e}")
@@ -604,91 +965,222 @@ async def get_or_create_vps_role(guild):
 
 # Host resource functions
 def get_host_cpu_usage():
+    """Get host CPU usage - cross-platform compatible"""
     try:
-        if shutil.which("mpstat"):
-            result = subprocess.run(['mpstat', '1', '1'], capture_output=True, text=True)
-            output = result.stdout
-            for line in output.split('\n'):
-                if 'all' in line and '%' in line:
-                    parts = line.split()
-                    idle = float(parts[-1])
-                    return 100.0 - idle
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            # Windows: Use wmic or psutil as fallback
+            try:
+                import psutil
+                return psutil.cpu_percent(interval=1)
+            except ImportError:
+                # Fallback for Windows without psutil
+                try:
+                    result = subprocess.run(['wmic', 'os', 'get', 'TotalVisibleMemorySize'], 
+                                          capture_output=True, text=True, timeout=5)
+                    return 0.0  # Default value on Windows
+                except:
+                    return 0.0
         else:
-            result = subprocess.run(['top', '-bn1'], capture_output=True, text=True)
-            output = result.stdout
-            for line in output.split('\n'):
-                if '%Cpu(s):' in line:
-                    parts = line.split()
-                    us = float(parts[1])
-                    sy = float(parts[3])
-                    ni = float(parts[5])
-                    id_ = float(parts[7])
-                    wa = float(parts[9])
-                    hi = float(parts[11])
-                    si = float(parts[13])
-                    st = float(parts[15])
-                    usage = us + sy + ni + wa + hi + si + st
-                    return usage
-        return 0.0
+            # Linux/Unix: Use mpstat or top
+            if shutil.which("mpstat"):
+                result = subprocess.run(['mpstat', '1', '1'], capture_output=True, text=True, timeout=10)
+                output = result.stdout
+                for line in output.split('\n'):
+                    if 'all' in line and '%' in line:
+                        parts = line.split()
+                        idle = float(parts[-1])
+                        return 100.0 - idle
+            else:
+                result = subprocess.run(['top', '-bn1'], capture_output=True, text=True, timeout=10)
+                output = result.stdout
+                for line in output.split('\n'):
+                    if '%Cpu(s):' in line:
+                        # Parse CPU line - format: %Cpu(s): us,sy,ni,id,wa,hi,si,st
+                        cpu_data = line.split('%Cpu(s):')[1].strip()
+                        parts = []
+                        for item in cpu_data.split(','):
+                            val = item.split()[0].strip()
+                            try:
+                                parts.append(float(val))
+                            except ValueError:
+                                parts.append(0.0)
+                        
+                        if len(parts) >= 8:
+                            us = parts[0]
+                            sy = parts[1]
+                            ni = parts[2]
+                            id_ = parts[3]
+                            wa = parts[4]
+                            hi = parts[5]
+                            si = parts[6]
+                            st = parts[7]
+                            usage = us + sy + ni + wa + hi + si + st
+                            return usage
+            return 0.0
     except Exception as e:
-        logger.error(f"Error getting CPU usage: {e}")
+        logger.debug(f"Error getting CPU usage: {e}")
         return 0.0
 
 def get_host_ram_usage():
+    """Get host RAM usage - cross-platform compatible"""
     try:
-        result = subprocess.run(['free', '-m'], capture_output=True, text=True)
-        lines = result.stdout.splitlines()
-        if len(lines) > 1:
-            mem = lines[1].split()
-            total = int(mem[1])
-            used = int(mem[2])
-            return (used / total * 100) if total > 0 else 0.0
-        return 0.0
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            # Windows: Use psutil or wmic
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                return mem.percent
+            except ImportError:
+                # Fallback for Windows without psutil
+                try:
+                    result = subprocess.run(['wmic', 'OS', 'get', 'TotalVisibleMemorySize,FreePhysicalMemory'], 
+                                          capture_output=True, text=True, timeout=5)
+                    lines = result.stdout.strip().split('\n')
+                    if len(lines) > 1:
+                        values = lines[1].split()
+                        if len(values) >= 2:
+                            total = int(values[0])
+                            free = int(values[1])
+                            used = total - free
+                            return (used / total * 100) if total > 0 else 0.0
+                except:
+                    pass
+                return 0.0
+        else:
+            # Linux/Unix: Use free command
+            result = subprocess.run(['free', '-m'], capture_output=True, text=True, timeout=10)
+            lines = result.stdout.splitlines()
+            if len(lines) > 1:
+                mem = lines[1].split()
+                total = int(mem[1])
+                used = int(mem[2])
+                return (used / total * 100) if total > 0 else 0.0
+            return 0.0
     except Exception as e:
-        logger.error(f"Error getting RAM usage: {e}")
+        logger.debug(f"Error getting RAM usage: {e}")
         return 0.0
 
 async def get_host_stats(node_id: int) -> Dict:
     node = get_node(node_id)
     if node['is_local']:
-        return {"cpu": get_host_cpu_usage(), "ram": get_host_ram_usage()}
+        return {
+            "cpu": get_host_cpu_usage(),
+            "ram": get_host_ram_usage(),
+            "disk": get_host_disk_usage()
+        }
     else:
+        # Remote node - handle gracefully if unreachable
         url = f"{node['url']}/api/get_host_stats"
         params = {"api_key": node["api_key"]}
         try:
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
-            return response.json()
+            stats = response.json()
+            # Fallbacks if remote API doesn't provide
+            stats['disk'] = stats.get('disk', 'Unknown')
+            return stats
+        except requests.exceptions.ConnectionError:
+            # Remote node unreachable - return graceful defaults
+            logger.debug(f"Remote node {node['name']} unreachable - returning default stats")
+            return {"cpu": 0.0, "ram": 0.0, "disk": "Unknown"}
         except Exception as e:
-            logger.error(f"Failed to get host stats from node {node['name']}: {e}")
-            return {"cpu": 0.0, "ram": 0.0}
+            logger.debug(f"Failed to get stats from remote node {node['name']}: {e}")
+            return {"cpu": 0.0, "ram": 0.0, "disk": "Unknown"}
+
+def check_vps_expiration():
+    """Check and auto-suspend expired VPS"""
+    global bot
+    try:
+        warned_users = set()
+        
+        for user_id, vps_list in vps_data.items():
+            for vps in vps_list:
+                if vps.get('expiration_date'):
+                    expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+                    days_remaining = (expiration_dt - datetime.now()).days
+                    hours_remaining = ((expiration_dt - datetime.now()).total_seconds() / 3600)
+                    
+                    container_name = vps['container_name']
+                    node_id = vps.get('node_id', 1)
+                    
+                    # Auto-suspend if expired
+                    if days_remaining < 0:
+                        if not vps.get('suspended', False):
+                            try:
+                                # Suspend the VPS
+                                asyncio.run(execute_lxc(container_name, f"stop {container_name}", node_id=node_id))
+                                vps['status'] = 'stopped'
+                                vps['suspended'] = True
+                                vps['suspension_history'].append({
+                                    'time': datetime.now().isoformat(),
+                                    'reason': f'Auto-suspended due to VPS expiration on {expiration_dt.strftime("%Y-%m-%d")}',
+                                    'by': 'Expiration Monitor'
+                                })
+                                save_vps_data_immediate()
+                                logger.warning(f"VPS {container_name} auto-suspended due to expiration")
+                                
+                                # Notify owner
+                                try:
+                                    owner = asyncio.run(bot.fetch_user(int(user_id)))
+                                    dm_embed = create_error_embed("🔴 VPS Expired and Suspended",
+                                        f"Your VPS `{container_name}` has expired and been suspended.\n\n"
+                                        f"**Expiration Date:** {expiration_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                        f"Contact an admin to renew your VPS.")
+                                    asyncio.run(owner.send(embed=dm_embed))
+                                except Exception as e:
+                                    logger.debug(f"Failed to notify user {user_id}: {e}")
+                            except Exception as e:
+                                logger.error(f"Failed to auto-suspend VPS {container_name}: {e}")
+                    
+                    # Send warning if expiring soon
+                    elif 0 < hours_remaining <= (EXPIRATION_WARNING_DAYS * 24):
+                        if user_id not in warned_users:
+                            try:
+                                owner = asyncio.run(bot.fetch_user(int(user_id)))
+                                dm_embed = create_warning_embed("⏰ VPS Expiring Soon",
+                                    f"Your VPS `{container_name}` will expire in {days_remaining} day(s)!\n\n"
+                                    f"**Expiration Date:** {expiration_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                    f"Contact an admin to renew your VPS before it's automatically suspended.")
+                                asyncio.run(owner.send(embed=dm_embed))
+                                warned_users.add(user_id)
+                                logger.info(f"Sent expiration warning to user {user_id}")
+                            except Exception as e:
+                                logger.debug(f"Failed to notify user {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error in VPS expiration check: {e}")
 
 def resource_monitor():
     global resource_monitor_active
-    backup_interval = 3600
-    last_backup = time.time()
+    last_expiration_check = time.time()
+    expiration_check_interval = 3600  # Check every hour
+    
     while resource_monitor_active:
         try:
+            # Check VPS expiration every hour
+            if time.time() - last_expiration_check > expiration_check_interval:
+                check_vps_expiration()
+                last_expiration_check = time.time()
+            
             nodes = get_nodes()
             for node in nodes:
-                stats = asyncio.run(get_host_stats(node['id']))
-                cpu = stats['cpu']
-                ram = stats['ram']
-                logger.info(f"Node {node['name']}: CPU {cpu:.1f}%, RAM {ram:.1f}%")
-                if cpu > CPU_THRESHOLD or ram > RAM_THRESHOLD:
-                    logger.warning(f"Node {node['name']} exceeded thresholds (CPU: {CPU_THRESHOLD}%, RAM: {RAM_THRESHOLD}%). Manual intervention required.")
-            if time.time() - last_backup > backup_interval:
-                backup_name = f"vps_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-                try:
-                    shutil.copy('vps.db', backup_name)
-                    if os.path.exists('vps.db-wal'):
-                        shutil.copy('vps.db-wal', f"{backup_name}-wal")
-                    if os.path.exists('vps.db-shm'):
-                        shutil.copy('vps.db-shm', f"{backup_name}-shm")
-                    logger.info(f"Database backup created: {backup_name}")
-                    last_backup = time.time()
-                except Exception as e:
-                    logger.error(f"Failed to create DB backup: {e}")
+                # Only monitor LOCAL nodes - skip remote nodes to avoid "No route to host" errors
+                if node['is_local']:
+                    stats = asyncio.run(get_host_stats(node['id']))
+                    cpu = stats['cpu']
+                    ram = stats['ram']
+                    logger.info(f"Node {node['name']}: CPU {cpu:.1f}%, RAM {ram:.1f}%")
+                    if cpu > CPU_THRESHOLD or ram > RAM_THRESHOLD:
+                        logger.warning(f"Node {node['name']} exceeded thresholds (CPU: {CPU_THRESHOLD}%, RAM: {RAM_THRESHOLD}%). Manual intervention required.")
+                else:
+                    # Remote nodes - skip monitoring to avoid connection errors
+                    logger.debug(f"Skipping remote node {node['name']} - remote nodes monitored on-demand only")
+            
             time.sleep(60)
         except Exception as e:
             logger.error(f"Error in resource monitor: {e}")
@@ -711,15 +1203,20 @@ async def get_container_stats(container_name: str, node_id: Optional[int] = None
         uptime = await get_container_uptime_local(container_name)
         return {"status": status, "cpu": cpu, "ram": ram, "disk": disk, "uptime": uptime}
     else:
+        # Remote node - handle unreachable nodes gracefully without spamming logs
         url = f"{node['url']}/api/get_container_stats"
         data = {"container": container_name}
         params = {"api_key": node["api_key"]}
         try:
-            response = requests.post(url, json=data, params=params)
+            response = requests.post(url, json=data, params=params, timeout=10)
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.ConnectionError:
+            # Remote node unreachable - return graceful defaults
+            logger.debug(f"Remote node {node['name']} unreachable for container {container_name}")
+            return {"status": "unknown", "cpu": 0.0, "ram": {"used": 0, "total": 0, "pct": 0.0}, "disk": "Unknown", "uptime": "Unknown"}
         except Exception as e:
-            logger.error(f"Failed to get container stats from node {node['name']}: {e}")
+            logger.debug(f"Failed to get container stats from remote node {node['name']}: {e}")
             return {"status": "unknown", "cpu": 0.0, "ram": {"used": 0, "total": 0, "pct": 0.0}, "disk": "Unknown", "uptime": "Unknown"}
 
 async def get_container_status_local(container_name: str):
@@ -749,19 +1246,31 @@ async def get_container_cpu_pct_local(container_name: str):
         output = stdout.decode()
         for line in output.splitlines():
             if '%Cpu(s):' in line:
-                parts = line.split()
-                us = float(parts[1])
-                sy = float(parts[3])
-                ni = float(parts[5])
-                id_ = float(parts[7])
-                wa = float(parts[9])
-                hi = float(parts[11])
-                si = float(parts[13])
-                st = float(parts[15])
-                return us + sy + ni + wa + hi + si + st
+                # Parse CPU line - format: %Cpu(s): us,sy,ni,id,wa,hi,si,st
+                # Remove label and split by commas
+                cpu_data = line.split('%Cpu(s):')[1].strip()
+                parts = []
+                for item in cpu_data.split(','):
+                    # Extract number before the percentage/label
+                    val = item.split()[0].strip()
+                    try:
+                        parts.append(float(val))
+                    except ValueError:
+                        parts.append(0.0)
+                
+                if len(parts) >= 8:
+                    us = parts[0]  # user
+                    sy = parts[1]  # system
+                    ni = parts[2]  # nice
+                    id_ = parts[3] # idle
+                    wa = parts[4]  # wait
+                    hi = parts[5]  # hardware interrupt
+                    si = parts[6]  # software interrupt
+                    st = parts[7]  # steal
+                    return us + sy + ni + wa + hi + si + st
         return 0.0
     except Exception as e:
-        logger.error(f"Error getting CPU for {container_name}: {e}")
+        logger.error(f"Error getting container CPU for {container_name}: {e}")
         return 0.0
 
 async def get_container_ram_local(container_name: str):
@@ -838,6 +1347,65 @@ async def get_container_ram_pct(container_name: str, node_id: Optional[int] = No
     stats = await get_container_stats(container_name, node_id)
     return stats['ram']['pct']
 
+async def get_container_networks(container_name: str, node_id: Optional[int] = None) -> Dict[str, str]:
+    """Get all network interfaces and their IPs from a container using ip addr command"""
+    try:
+        if node_id is None:
+            node_id = find_node_id_for_container(container_name)
+        
+        # First attempt: Use simple ip addr show command
+        proc = await asyncio.create_subprocess_exec(
+            "lxc", "exec", container_name, "--", "ip", "addr", "show",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        
+        networks = {}
+        
+        if proc.returncode == 0:
+            output = stdout.decode().strip()
+            
+            # Parse ip addr show output
+            # Format: 
+            # 2: eth0: <BROADCAST,RUNNING> mtu 1500
+            #     inet 10.0.0.10/24 brd 10.0.0.255 scope global eth0
+            
+            lines = output.split('\n')
+            current_interface = None
+            
+            for line in lines:
+                # Check for interface line (starts with number and interface name)
+                if line and line[0].isdigit():
+                    # Extract interface name from line like "2: eth0: <BROADCAST>"
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        current_interface = parts[1].strip()
+                
+                # Check for inet line (IPv4 address)
+                elif 'inet ' in line and current_interface:
+                    # Extract IP from line like "    inet 10.0.0.10/24 brd 10.0.0.255 scope global eth0"
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[0] == 'inet':
+                        ip_with_cidr = parts[1]
+                        ip = ip_with_cidr.split('/')[0]
+                        
+                        # Skip loopback
+                        if ip != "127.0.0.1" and current_interface != "lo":
+                            networks[current_interface] = ip
+        else:
+            logger.warning(f"Failed to get network info for {container_name}: {stderr.decode()}")
+        
+        if networks:
+            logger.info(f"Found {len(networks)} network interfaces on {container_name}: {networks}")
+        else:
+            logger.warning(f"No usable network interfaces found for {container_name}")
+        
+        return networks
+    except Exception as e:
+        logger.error(f"Error getting networks for {container_name}: {e}")
+        return {}
+
 async def get_container_disk(container_name: str, node_id: Optional[int] = None):
     stats = await get_container_stats(container_name, node_id)
     return stats['disk']
@@ -847,10 +1415,34 @@ async def get_container_uptime(container_name: str, node_id: Optional[int] = Non
     return stats['uptime']
 
 def get_uptime():
+    """Get system uptime - cross-platform compatible"""
     try:
-        result = subprocess.run(['uptime'], capture_output=True, text=True)
-        return result.stdout.strip()
-    except Exception:
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            try:
+                result = subprocess.run(['net', 'statistics', 'server'], 
+                                      capture_output=True, text=True, timeout=5)
+                output = result.stdout
+                for line in output.split('\n'):
+                    if 'Statistics since' in line:
+                        return line.strip()
+                return "Unknown"
+            except:
+                # Fallback: use wmic
+                try:
+                    result = subprocess.run(['wmic', 'os', 'get', 'lastbootuptime'], 
+                                          capture_output=True, text=True, timeout=5)
+                    return result.stdout.strip() if result.stdout else "Unknown"
+                except:
+                    return "Unknown"
+        else:
+            # Linux/Unix: Use uptime command
+            result = subprocess.run(['uptime'], capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+    except Exception as e:
+        logger.debug(f"Error getting uptime: {e}")
         return "Unknown"
 
 # Try to detect default storage pool or use common defaults
@@ -871,16 +1463,27 @@ DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', get_default_storage_poo
 # Bot events
 @bot.event
 async def on_ready():
+    global vps_data, admin_data
     logger.info(f'{bot.user} has connected to Discord!')
+    # Reload ALL data from DB on every ready (covers restarts + gateway reconnects)
+    vps_data = get_vps_data()
+    admin_data = {'admins': get_admins()}
+    total = sum(len(v) for v in vps_data.values())
+    logger.info(f"Loaded {total} VPS records from database.")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=f"{BOT_NAME} VPS Manager"))
     logger.info(f"{BOT_NAME} Bot is ready!")
+    # Start auto-save background task (only once)
+    if not hasattr(bot, '_auto_save_started'):
+        bot._auto_save_started = True
+        bot.loop.create_task(auto_save_task())
+        bot.loop.create_task(rotating_presence_task())
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(embed=create_error_embed("Missing Argument", "Please check command usage with `!help`."))
+        await ctx.send(embed=create_error_embed("Missing Argument", f"Please check command usage with `{PREFIX}help`."))
     elif isinstance(error, commands.BadArgument):
         await ctx.send(embed=create_error_embed("Invalid Argument", "Please check your input and try again."))
     elif isinstance(error, commands.CheckFailure):
@@ -895,8 +1498,15 @@ async def on_command_error(ctx, error):
 # Bot commands
 @bot.command(name='ping')
 async def ping(ctx):
+    """Check bot latency"""
     latency = round(bot.latency * 1000)
-    embed = create_success_embed("Pong!", f"{BOT_NAME} Bot latency: {latency}ms")
+    embed = create_success_embed(
+        "🏓 Pong!",
+        f"Bot is responding perfectly!"
+    )
+    add_field(embed, "Latency", f"`{latency}ms`", inline=True)
+    add_field(embed, "Status", "✅ Online", inline=True)
+    add_field(embed, "Bot", f"`{BOT_NAME} v{BOT_VERSION}`", inline=True)
     await ctx.send(embed=embed)
 
 @bot.command(name='uptime')
@@ -995,12 +1605,29 @@ async def my_vps(ctx):
         if vps.get("whitelisted"):
             whitelisted += 1
 
-        vps_cards.append(
+        # Build VPS card
+        card = (
             f"**{i}.** `{vps['container_name']}`\n"
             f"{status} • `{config}`\n"
             f"⚙️ `{ram}` RAM • `{cpu}` CPU • `{storage}` Disk\n"
             f"📍 Node: `{node_name}`"
         )
+        
+        # Add expiration info if set
+        if vps.get('expiration_date'):
+            expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+            days_remaining = (expiration_dt - datetime.now()).days
+            
+            if days_remaining < 0:
+                expiration_badge = "🔴 EXPIRED"
+            elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                expiration_badge = "🟡 EXPIRING"
+            else:
+                expiration_badge = "🟢 ACTIVE"
+            
+            card += f"\n⏰ {expiration_badge} • Expires: `{expiration_dt.strftime('%Y-%m-%d')}`"
+        
+        vps_cards.append(card)
 
     # ─── Row 1 : Summary ──────────────────────────────────────
     embed.add_field(
@@ -1039,7 +1666,7 @@ async def my_vps(ctx):
             inline=False
         )
 
-    embed.set_footer(text=f"{BOT_NAME} • VPS Control Panel")
+    embed.set_footer(text=f"Made by Hopingboyz • VPS Control Panel")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -1056,19 +1683,22 @@ async def lxc_list(ctx, node_id: int = 1):
         await ctx.send(embed=create_error_embed("Error", str(e)))
 
 class NodeSelectView(discord.ui.View):
-    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx):
+    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, expiry_days: int = None):
         super().__init__(timeout=300)
         self.ram = ram
         self.cpu = cpu
         self.disk = disk
         self.user = user
         self.ctx = ctx
+        self.expiry_days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_VPS_EXPIRATION_DAYS
         nodes = get_nodes()
         options = []
         for n in nodes:
+            # Show BOTH local and remote nodes for VPS creation (multi-node support)
             current_count = get_current_vps_count(n['id'])
             if current_count < n['total_vps']:
-                options.append(discord.SelectOption(label=n['name'], value=str(n['id']), description=f"{n['location']} - Available: {n['total_vps'] - current_count}"))
+                node_type = "📍 Local" if n['is_local'] else "🌐 Remote"
+                options.append(discord.SelectOption(label=f"{n['name']} {node_type}", value=str(n['id']), description=f"{n['location']} - Available: {n['total_vps'] - current_count}"))
         if not options:
             self.add_item(discord.ui.Select(placeholder="No available nodes", disabled=True))
         else:
@@ -1083,11 +1713,11 @@ class NodeSelectView(discord.ui.View):
         node_id = int(self.select.values[0])
         self.select.disabled = True
         await interaction.response.edit_message(view=self)
-        os_view = OSSelectView(self.ram, self.cpu, self.disk, self.user, self.ctx, node_id)
+        os_view = OSSelectView(self.ram, self.cpu, self.disk, self.user, self.ctx, node_id, self.expiry_days)
         await interaction.followup.send(embed=create_info_embed("Select OS", "Choose the OS for the VPS."), view=os_view)
 
 class OSSelectView(discord.ui.View):
-    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, node_id: int):
+    def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, node_id: int, expiry_days: int = None):
         super().__init__(timeout=300)
         self.ram = ram
         self.cpu = cpu
@@ -1095,6 +1725,7 @@ class OSSelectView(discord.ui.View):
         self.user = user
         self.ctx = ctx
         self.node_id = node_id
+        self.expiry_days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_VPS_EXPIRATION_DAYS
         self.select = discord.ui.Select(
             placeholder="Select an OS for the VPS",
             options=[discord.SelectOption(label=o["label"], value=o["value"]) for o in OS_OPTIONS]
@@ -1111,13 +1742,25 @@ class OSSelectView(discord.ui.View):
         creating_embed = create_info_embed("Creating VPS", f"Deploying {os_version} VPS for {self.user.mention} on node {self.node_id}...")
         await interaction.response.edit_message(embed=creating_embed, view=self)
         user_id = str(self.user.id)
-        if user_id not in vps_data:
-            vps_data[user_id] = []
-        vps_count = len(vps_data[user_id]) + 1
-        container_name = f"{BOT_NAME.lower()}-vps-{user_id}-{vps_count}"
+        # Create shorter container name with GLOBAL VPS ID
+        username = self.user.name.lower().replace(" ", "-")[:15]  # Limit to 15 chars
+        
+        # Get next global VPS ID from database (auto-increment)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(id) FROM vps")
+        max_id = cur.fetchone()[0] or 0
+        global_vps_id = max_id + 1
+        conn.close()
+        
+        # New naming format: <sanitized-username>-vps-<global-id>
+        # Example: hopingboyz-vps-1, alexuser-vps-2, btw-infinite-vps-3
+        # Sanitize username: remove underscores, spaces, special chars
+        sanitized_username = sanitize_username_for_container(username)
+        container_name = f"{sanitized_username}-vps-{global_vps_id}"
         ram_mb = self.ram * 1024
         try:
-            await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL}", node_id=self.node_id)
+            await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL} -c security.privileged=true", node_id=self.node_id)
             await execute_lxc(container_name, f"config set {container_name} limits.memory {ram_mb}MB", node_id=self.node_id)
             await execute_lxc(container_name, f"config set {container_name} limits.cpu {self.cpu}", node_id=self.node_id)
             await execute_lxc(container_name, f"config device set {container_name} root size={self.disk}GB", node_id=self.node_id)
@@ -1125,6 +1768,23 @@ class OSSelectView(discord.ui.View):
             await execute_lxc(container_name, f"start {container_name}", node_id=self.node_id)
             await apply_internal_permissions(container_name, self.node_id)
             await recreate_port_forwards(container_name)
+            
+            # Generate strong password
+            root_password = generate_strong_password()
+            
+            # Configure SSH and set password
+            success, result = await configure_ssh(container_name, self.node_id, root_password)
+            if not success:
+                logger.warning(f"SSH configuration partially failed: {result}")
+            
+            # Execute HOST_MOTD command if configured
+            if HOST_MOTD:
+                try:
+                    await execute_lxc(container_name, f"exec {container_name} -- bash -c \"{HOST_MOTD}\"", node_id=self.node_id)
+                    logger.info(f"HOST_MOTD executed on {container_name}")
+                except Exception as e:
+                    logger.warning(f"HOST_MOTD execution failed for {container_name}: {e}")
+            
             config_str = f"{self.ram}GB RAM / {self.cpu} CPU / {self.disk}GB Disk"
             vps_info = {
                 "container_name": container_name,
@@ -1140,10 +1800,14 @@ class OSSelectView(discord.ui.View):
                 "suspension_history": [],
                 "created_at": datetime.now().isoformat(),
                 "shared_with": [],
-                "id": None
+                "expiration_date": (datetime.now() + timedelta(days=self.expiry_days)).isoformat(),
+                "root_password": root_password,
+                "id": global_vps_id
             }
+            if user_id not in vps_data:
+                vps_data[user_id] = []
             vps_data[user_id].append(vps_info)
-            save_vps_data()
+            save_vps_data_immediate()
             if self.ctx.guild:
                 vps_role = await get_or_create_vps_role(self.ctx.guild)
                 if vps_role:
@@ -1153,18 +1817,77 @@ class OSSelectView(discord.ui.View):
                         logger.warning(f"Failed to assign VPS role to {self.user.name}")
             success_embed = create_success_embed("VPS Created Successfully")
             add_field(success_embed, "Owner", self.user.mention, True)
-            add_field(success_embed, "VPS ID", f"#{vps_count}", True)
+            add_field(success_embed, "VPS ID", f"#{global_vps_id}", True)
             add_field(success_embed, "Container", f"`{container_name}`", True)
             add_field(success_embed, "Node", get_node(self.node_id)['name'], True)
             add_field(success_embed, "Resources", f"**RAM:** {self.ram}GB\n**CPU:** {self.cpu} Cores\n**Storage:** {self.disk}GB", False)
             add_field(success_embed, "OS", os_version, True)
+            add_field(success_embed, "SSH Configuration", "✅ Configured (PasswordAuth enabled)", True)
+            add_field(success_embed, "SSH & Password", "✅ SSH configured for password authentication\n🔐 Root password generated and sent via DM\n📧 Check your DMs for SSH credentials!", False)
             add_field(success_embed, "Features", "Nesting, Privileged, FUSE, Kernel Modules (Docker Ready), Unprivileged Ports from 0", False)
             add_field(success_embed, "Disk Note", "Run `sudo resize2fs /` inside VPS if needed to expand filesystem.", False)
             await interaction.followup.send(embed=success_embed)
-            dm_embed = create_success_embed("VPS Created!", f"Your VPS has been successfully deployed by an admin!")
-            add_field(dm_embed, "VPS Details", f"**VPS ID:** #{vps_count}\n**Container Name:** `{container_name}`\n**Configuration:** {config_str}\n**Status:** Running\n**OS:** {os_version}\n**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", False)
-            add_field(dm_embed, "Management", f"• Use `{PREFIX}manage` to start/stop/reinstall your VPS\n• Use `{PREFIX}manage` → SSH for terminal access\n• Contact admin for upgrades or issues", False)
-            add_field(dm_embed, "Important Notes", "• Full root access via SSH\n• Docker-ready with nesting and privileged mode\n• Back up your data regularly", False)
+            dm_embed = create_success_embed("🎉 VPS Created Successfully!", f"Your new VPS is ready to use!")
+            
+            # VPS Details Section
+            vps_details = f"""
+**VPS ID:** #{global_vps_id}
+**Container:** `{container_name}`
+**Configuration:** {config_str}
+**Operating System:** {os_version}
+**Status:** 🟢 Running
+**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Expiration:** {(datetime.now() + timedelta(days=self.expiry_days)).strftime('%Y-%m-%d %H:%M:%S')} ({self.expiry_days} days)
+"""
+            add_field(dm_embed, "📊 VPS Details", vps_details.strip(), False)
+            
+            # Get all network interfaces - with timeout to prevent hanging
+            try:
+                networks = await asyncio.wait_for(
+                    get_container_networks(container_name, self.node_id),
+                    timeout=3.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout getting networks for {container_name}")
+                networks = {}
+            
+            if networks:
+                # Format SSH access info with all real interfaces
+                ssh_access_info = "**🖥️ Available Connection Points:**\n"
+                for interface, ip in sorted(networks.items()):
+                    ssh_access_info += f"└─ **{interface}:** `ssh root@{ip}`\n"
+                ssh_access_info += f"\n**🔑 Login Credentials:**\n"
+                ssh_access_info += f"**Username:** `root`\n"
+                ssh_access_info += f"**Password:** `{root_password}`\n"
+                ssh_access_info += f"\n**⚠️ Important:** Save this password securely!"
+            else:
+                # If no interfaces found, still show credentials (important!)
+                ssh_access_info = "**🔑 Login Credentials:**\n"
+                ssh_access_info += f"**Username:** `root`\n"
+                ssh_access_info += f"**Password:** `{root_password}`\n"
+                ssh_access_info += f"\n**📡 Network Setup:**\n"
+                ssh_access_info += "Your VPS is initializing its network interfaces.\n"
+                ssh_access_info += "They will be available in a few seconds.\n"
+                ssh_access_info += f"\n**⚠️ Important:** Save this password securely!"
+            
+            add_field(dm_embed, "🔐 SSH Credentials & Access", ssh_access_info, False)
+            
+            # SSH Features
+            features_info = """✅ **SSH:** Password authentication enabled
+✅ **SFTP:** File transfer available
+✅ **Root:** Full root access granted
+✅ **Ports:** All ports available for forwarding
+✅ **Docker:** Nesting, privileged mode, FUSE enabled
+✅ **Features:** Complete Linux container with full capabilities"""
+            add_field(dm_embed, "⚙️ Features & Capabilities", features_info, False)
+            
+            # Support Section
+            support_info = f"""**Need Help?**
+• Use `{PREFIX}manage` to start/stop/reinstall your VPS
+• Click 🔐 in manage to regenerate password
+• Contact admin for issues or upgrades
+• Check logs with: `journalctl -xe`"""
+            add_field(dm_embed, "📞 Support & Management", support_info, False)
             try:
                 await self.user.send(embed=dm_embed)
             except discord.Forbidden:
@@ -1175,12 +1898,19 @@ class OSSelectView(discord.ui.View):
 
 @bot.command(name='create')
 @is_admin()
-async def create_vps(ctx, ram: int, cpu: int, disk: int, user: discord.Member):
+async def create_vps(ctx, ram: int, cpu: int, disk: int, user: discord.Member, expiry_days: int = None):
     if ram <= 0 or cpu <= 0 or disk <= 0:
         await ctx.send(embed=create_error_embed("Invalid Specs", "RAM, CPU, and Disk must be positive integers."))
         return
-    embed = create_info_embed("VPS Creation", f"Creating VPS for {user.mention} with {ram}GB RAM, {cpu} CPU cores, {disk}GB Disk.\nSelect node below.")
-    view = NodeSelectView(ram, cpu, disk, user, ctx)
+    
+    # Validate expiry_days if provided
+    if expiry_days is not None and expiry_days <= 0:
+        await ctx.send(embed=create_error_embed("Invalid Expiry Days", "Expiry days must be a positive integer."))
+        return
+    
+    expiry_text = f" with {expiry_days} days expiry" if expiry_days else f" with {DEFAULT_VPS_EXPIRATION_DAYS} days expiry (default)"
+    embed = create_info_embed("VPS Creation", f"Creating VPS for {user.mention} with {ram}GB RAM, {cpu} CPU cores, {disk}GB Disk{expiry_text}.\nSelect node below.")
+    view = NodeSelectView(ram, cpu, disk, user, ctx, expiry_days)
     await ctx.send(embed=embed, view=view)
 
 class ReinstallOSSelectView(discord.ui.View):
@@ -1207,30 +1937,124 @@ class ReinstallOSSelectView(discord.ui.View):
         creating_embed = create_info_embed("Reinstalling VPS", f"Deploying {os_version} for `{self.container_name}`...")
         await interaction.response.edit_message(embed=creating_embed, view=self)
         ram_mb = self.ram_gb * 1024
+        
+        # Generate new password for reinstall
+        new_password = generate_strong_password()
+        
         try:
             # No need to delete again; already deleted in confirmation
-            await execute_lxc(self.container_name, f"init {os_version} {self.container_name} -s {DEFAULT_STORAGE_POOL}", node_id=self.node_id)
+            await execute_lxc(self.container_name, f"init {os_version} {self.container_name} -s {DEFAULT_STORAGE_POOL} -c security.privileged=true", node_id=self.node_id)
             await execute_lxc(self.container_name, f"config set {self.container_name} limits.memory {ram_mb}MB", node_id=self.node_id)
             await execute_lxc(self.container_name, f"config set {self.container_name} limits.cpu {self.cpu}", node_id=self.node_id)
             await execute_lxc(self.container_name, f"config device set {self.container_name} root size={self.storage_gb}GB", node_id=self.node_id)
             await apply_lxc_config(self.container_name, self.node_id)
             await execute_lxc(self.container_name, f"start {self.container_name}", node_id=self.node_id)
             await apply_internal_permissions(self.container_name, self.node_id)
+            
+            # Configure SSH and set new password
+            success, result = await configure_ssh(self.container_name, self.node_id, new_password)
+            if not success:
+                logger.warning(f"SSH configuration partially failed: {result}")
+            
+            # Execute HOST_MOTD command if configured
+            if HOST_MOTD:
+                try:
+                    await execute_lxc(self.container_name, f"exec {self.container_name} -- bash -c \"{HOST_MOTD}\"", node_id=self.node_id)
+                    logger.info(f"HOST_MOTD executed on {self.container_name}")
+                except Exception as e:
+                    logger.warning(f"HOST_MOTD execution failed for {self.container_name}: {e}")
+            
             await recreate_port_forwards(self.container_name)
             target_vps = vps_data[self.owner_id][self.actual_idx]
             target_vps["os_version"] = os_version
             target_vps["status"] = "running"
             target_vps["suspended"] = False
             target_vps["created_at"] = datetime.now().isoformat()
+            target_vps["root_password"] = new_password
             config_str = f"{self.ram_gb}GB RAM / {self.cpu} CPU / {self.storage_gb}GB Disk"
             target_vps["config"] = config_str
-            save_vps_data()
+            # IMPORTANT: Preserve expiration date during reinstall
+            # If expiration_date is missing or None, set it to current expiration + DEFAULT_VPS_EXPIRATION_DAYS
+            if not target_vps.get('expiration_date'):
+                # No expiration was set, so set it now
+                target_vps['expiration_date'] = (datetime.now() + timedelta(days=DEFAULT_VPS_EXPIRATION_DAYS)).isoformat()
+            # If expiration_date exists, keep it as is - don't reset on reinstall
+            save_vps_data_immediate()
             success_embed = create_success_embed("Reinstall Complete", f"VPS `{self.container_name}` has been successfully reinstalled!")
             add_field(success_embed, "Resources", f"**RAM:** {self.ram_gb}GB\n**CPU:** {self.cpu} Cores\n**Storage:** {self.storage_gb}GB", False)
             add_field(success_embed, "OS", os_version, True)
+            add_field(success_embed, "SSH Configuration", "✅ Configured (PasswordAuth enabled)\n🔐 New password generated and sent via DM", True)
             add_field(success_embed, "Features", "Nesting, Privileged, FUSE, Kernel Modules (Docker Ready), Unprivileged Ports from 0", False)
             add_field(success_embed, "Disk Note", "Run `sudo resize2fs /` inside VPS if needed to expand filesystem.", False)
             await interaction.followup.send(embed=success_embed, ephemeral=True)
+            
+            # Send DM to owner with new password
+            try:
+                owner = await bot.fetch_user(int(self.owner_id))
+                dm_embed = create_success_embed("🔄 VPS Reinstalled Successfully!", f"Your VPS `{self.container_name}` is ready with a new operating system!")
+                
+                # VPS Details Section
+                vps_details = f"""
+**Container:** `{self.container_name}`
+**New OS:** {os_version}
+**Configuration:** {self.ram_gb}GB RAM / {self.cpu} CPU / {self.storage_gb}GB Disk
+**Status:** 🟢 Running
+**Reinstalled:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+                add_field(dm_embed, "📊 VPS Details", vps_details.strip(), False)
+                
+                # Get all network interfaces - with timeout to prevent hanging
+                try:
+                    networks = await asyncio.wait_for(
+                        get_container_networks(self.container_name, self.node_id),
+                        timeout=3.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout getting networks for {self.container_name}")
+                    networks = {}
+                
+                if networks:
+                    # Format SSH access info with all real interfaces
+                    ssh_access_info = "**🖥️ Available Connection Points:**\n"
+                    for interface, ip in sorted(networks.items()):
+                        ssh_access_info += f"└─ **{interface}:** `ssh root@{ip}`\n"
+                    ssh_access_info += f"\n**🔑 New Login Credentials:**\n"
+                    ssh_access_info += f"**Username:** `root`\n"
+                    ssh_access_info += f"**Password:** `{new_password}`\n"
+                    ssh_access_info += f"\n**⚠️ Important:** Save this password securely!"
+                else:
+                    # If no interfaces found, still show credentials (important!)
+                    ssh_access_info = "**🔑 New Login Credentials:**\n"
+                    ssh_access_info += f"**Username:** `root`\n"
+                    ssh_access_info += f"**Password:** `{new_password}`\n"
+                    ssh_access_info += f"\n**� Network Setup:**\n"
+                    ssh_access_info += "Your VPS is initializing its network interfaces.\n"
+                    ssh_access_info += "They will be available in a few seconds.\n"
+                    ssh_access_info += f"\n**⚠️ Important:** Save this password securely!"
+                
+                add_field(dm_embed, "🔐 SSH Credentials & Access", ssh_access_info, False)
+                
+                # SSH Features
+                features_info = """✅ **SSH:** Password authentication enabled
+✅ **SFTP:** File transfer available
+✅ **Root:** Full root access granted
+✅ **Ports:** All ports available for forwarding
+✅ **Docker:** Nesting, privileged mode, FUSE enabled
+✅ **Fresh:** Clean OS installation ready to use"""
+                add_field(dm_embed, "⚙️ Features & Capabilities", features_info, False)
+                
+                # Support Section
+                support_info = f"""**Need Help?**
+• Use `{PREFIX}manage` to manage your VPS
+• Click 🔐 in manage to regenerate password
+• Contact admin for issues or upgrades
+• Your data from the previous OS has been wiped"""
+                add_field(dm_embed, "📞 Support & Management", support_info, False)
+                
+                await owner.send(embed=dm_embed)
+            except Exception as e:
+                logger.warning(f"Failed to send reinstall DM to {self.owner_id}: {e}")
+            
             self.stop()
         except Exception as e:
             error_embed = create_error_embed("Reinstall Failed", f"Error: {str(e)}")
@@ -1283,8 +2107,9 @@ class ManageView(discord.ui.View):
         whitelisted = vps.get('whitelisted', False)
         status_color = 0x00ff88 if status == 'running' and not suspended else 0xffaa00 if suspended else 0xff3366
         container_name = vps['container_name']
-        stats = await get_container_stats(container_name)
-        status_text = f"{stats['status'].upper()}"
+        stats = await get_container_stats(container_name, vps['node_id'])
+        # Use stored VPS status, not stats status (stats status may be unknown for remote nodes)
+        status_text = f"{status.upper()}"
         if suspended:
             status_text += " (SUSPENDED)"
         if whitelisted:
@@ -1309,11 +2134,44 @@ class ManageView(discord.ui.View):
         resource_info += f"**OS:** {vps.get('os_version', 'ubuntu:22.04')}\n"
         resource_info += f"**Uptime:** {stats['uptime']}"
         add_field(embed, "📊 Allocated Resources", resource_info, False)
+        
+        # Add expiration info
+        if vps.get('expiration_date'):
+            expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+            days_remaining = (expiration_dt - datetime.now()).days
+            
+            if days_remaining < 0:
+                expiration_status = "🔴 EXPIRED"
+                expiration_color = 0xff3366
+            elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                expiration_status = "🟡 EXPIRING SOON"
+                expiration_color = 0xffaa00
+            else:
+                expiration_status = "🟢 ACTIVE"
+                expiration_color = 0x00ff88
+            
+            expiration_info = f"**Status:** {expiration_status}\n"
+            expiration_info += f"**Expires:** {expiration_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            expiration_info += f"**Days Left:** {max(0, days_remaining)} days"
+            add_field(embed, "⏰ Expiration", expiration_info, False)
+        else:
+            add_field(embed, "⏰ Expiration", "No expiration date set", False)
+        
         if suspended:
             add_field(embed, "⚠️ Suspended", "This VPS is suspended. Contact an admin to unsuspend.", False)
         if whitelisted:
             add_field(embed, "✅ Whitelisted", "This VPS is exempt from auto-suspension.", False)
-        live_stats = f"**CPU Usage:** {stats['cpu']:.1f}%\n**Memory:** {stats['ram']['used']}/{stats['ram']['total']} MB ({stats['ram']['pct']:.1f}%)\n**Disk:** {stats['disk']}"
+        
+        # Safely build live stats (handle unknown values)
+        cpu_usage = f"{stats.get('cpu', 0):.1f}%" if stats.get('cpu') is not None else "Unknown"
+        ram_data = stats.get('ram', {})
+        ram_used = ram_data.get('used', 0) if isinstance(ram_data, dict) else 0
+        ram_total = ram_data.get('total', 0) if isinstance(ram_data, dict) else 0
+        ram_pct = ram_data.get('pct', 0.0) if isinstance(ram_data, dict) else 0.0
+        ram_str = f"{ram_used}/{ram_total} MB ({ram_pct:.1f}%)" if ram_total > 0 else "Unknown"
+        disk_usage = stats.get('disk', 'Unknown')
+        
+        live_stats = f"**CPU Usage:** {cpu_usage}\n**Memory:** {ram_str}\n**Disk:** {disk_usage}"
         add_field(embed, "📈 Live Usage", live_stats, False)
         add_field(embed, "🎮 Controls", "Use the buttons below to manage your VPS", False)
         return embed
@@ -1329,11 +2187,14 @@ class ManageView(discord.ui.View):
         stop_button.callback = lambda inter: self.action_callback(inter, 'stop')
         ssh_button = discord.ui.Button(label="🔑 SSH", style=discord.ButtonStyle.primary)
         ssh_button.callback = lambda inter: self.action_callback(inter, 'tmate')
+        sshx_button = discord.ui.Button(label="🌐 SSHX", style=discord.ButtonStyle.primary)
+        sshx_button.callback = lambda inter: self.action_callback(inter, 'sshx')
         stats_button = discord.ui.Button(label="📊 Stats", style=discord.ButtonStyle.secondary)
         stats_button.callback = lambda inter: self.action_callback(inter, 'stats')
         self.add_item(start_button)
         self.add_item(stop_button)
         self.add_item(ssh_button)
+        self.add_item(sshx_button)
         self.add_item(stats_button)
 
     async def select_vps(self, interaction: discord.Interaction):
@@ -1348,36 +2209,46 @@ class ManageView(discord.ui.View):
         await interaction.edit_original_response(embed=new_embed, view=self)
 
     async def action_callback(self, interaction: discord.Interaction, action: str):
+        # Defer immediately to prevent interaction timeout (3-second window)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except:
+            # Already responded or interaction expired
+            return
+        
         if str(interaction.user.id) != self.user_id and not self.is_admin:
-            await interaction.response.send_message(embed=create_error_embed("Access Denied", "This is not your VPS!"), ephemeral=True)
+            await interaction.followup.send(embed=create_error_embed("Access Denied", "This is not your VPS!"), ephemeral=True)
             return
         if self.selected_index is None:
-            await interaction.response.send_message(embed=create_error_embed("No VPS Selected", "Please select a VPS first."), ephemeral=True)
+            await interaction.followup.send(embed=create_error_embed("No VPS Selected", "Please select a VPS first."), ephemeral=True)
             return
         actual_idx = self.actual_index if self.is_shared else self.indices[self.selected_index]
         target_vps = vps_data[self.owner_id][actual_idx]
         suspended = target_vps.get('suspended', False)
         if suspended and not self.is_admin and action != 'stats':
-            await interaction.response.send_message(embed=create_error_embed("Access Denied", "This VPS is suspended. Contact an admin to unsuspend."), ephemeral=True)
+            await interaction.followup.send(embed=create_error_embed("Access Denied", "This VPS is suspended. Contact an admin to unsuspend."), ephemeral=True)
             return
         container_name = target_vps["container_name"]
         node_id = target_vps['node_id']
         if action == 'stats':
-            stats = await get_container_stats(container_name, node_id)
-            stats_embed = create_info_embed("📈 Live Statistics", f"Real-time stats for `{container_name}`")
-            add_field(stats_embed, "Status", f"`{stats['status'].upper()}`", True)
-            add_field(stats_embed, "CPU", f"{stats['cpu']:.1f}%", True)
-            add_field(stats_embed, "Memory", f"{stats['ram']['used']}/{stats['ram']['total']} MB ({stats['ram']['pct']:.1f}%)", True)
-            add_field(stats_embed, "Disk", stats['disk'], True)
-            add_field(stats_embed, "Uptime", stats['uptime'], True)
-            await interaction.response.send_message(embed=stats_embed, ephemeral=True)
+            try:
+                stats = await get_container_stats(container_name, node_id)
+                stats_embed = create_info_embed("📈 Live Statistics", f"Real-time stats for `{container_name}`")
+                add_field(stats_embed, "Status", f"`{stats['status'].upper()}`", True)
+                add_field(stats_embed, "CPU", f"{stats['cpu']:.1f}%", True)
+                add_field(stats_embed, "Memory", f"{stats['ram']['used']}/{stats['ram']['total']} MB ({stats['ram']['pct']:.1f}%)", True)
+                add_field(stats_embed, "Disk", stats['disk'], True)
+                add_field(stats_embed, "Uptime", stats['uptime'], True)
+                await interaction.followup.send(embed=stats_embed, ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(embed=create_error_embed("Stats Failed", str(e)), ephemeral=True)
             return
         if action == 'reinstall':
             if self.is_shared or self.is_admin:
-                await interaction.response.send_message(embed=create_error_embed("Access Denied", "Only the VPS owner can reinstall!"), ephemeral=True)
+                await interaction.followup.send(embed=create_error_embed("Access Denied", "Only the VPS owner can reinstall!"), ephemeral=True)
                 return
             if suspended:
-                await interaction.response.send_message(embed=create_error_embed("Cannot Reinstall", "Unsuspend the VPS first."), ephemeral=True)
+                await interaction.followup.send(embed=create_error_embed("Cannot Reinstall", "Unsuspend the VPS first."), ephemeral=True)
                 return
             ram_gb = int(target_vps['ram'].replace('GB', ''))
             cpu = int(target_vps['cpu'])
@@ -1413,64 +2284,308 @@ class ManageView(discord.ui.View):
                     new_embed = await self.parent_view.create_vps_embed(self.parent_view.selected_index)
                     await inter.response.edit_message(embed=new_embed, view=self.parent_view)
 
-            await interaction.response.send_message(embed=confirm_embed, view=ConfirmView(self, container_name, self.owner_id, actual_idx, ram_gb, cpu, storage_gb, node_id), ephemeral=True)
+            await interaction.followup.send(embed=confirm_embed, view=ConfirmView(self, container_name, self.owner_id, actual_idx, ram_gb, cpu, storage_gb, node_id), ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        
         suspended = target_vps.get('suspended', False)
         if suspended:
             target_vps['suspended'] = False
-            save_vps_data()
+            save_vps_data_immediate()
         if action == 'start':
             try:
+                # Check current status to avoid "already running" error
+                current_status = target_vps.get('status', 'stopped')
+                if current_status == 'running':
+                    await interaction.followup.send(embed=create_info_embed("Already Running", f"VPS `{container_name}` is already running."), ephemeral=True)
+                    return
+                
                 await execute_lxc(container_name, f"start {container_name}", node_id=node_id)
                 target_vps["status"] = "running"
-                save_vps_data()
+                save_vps_data_immediate()
                 await apply_internal_permissions(container_name, node_id)
                 readded = await recreate_port_forwards(container_name)
                 await interaction.followup.send(embed=create_success_embed("VPS Started", f"VPS `{container_name}` is now running! Re-added {readded} port forwards."), ephemeral=True)
             except Exception as e:
-                await interaction.followup.send(embed=create_error_embed("Start Failed", str(e)), ephemeral=True)
+                # If error is "already running", update status
+                error_str = str(e).lower()
+                if "already running" in error_str:
+                    target_vps["status"] = "running"
+                    save_vps_data_immediate()
+                    await interaction.followup.send(embed=create_success_embed("VPS Started", f"VPS `{container_name}` is running!"), ephemeral=True)
+                else:
+                    await interaction.followup.send(embed=create_error_embed("Start Failed", str(e)), ephemeral=True)
         elif action == 'stop':
             try:
+                # Check current status to avoid "not running" error
+                current_status = target_vps.get('status', 'stopped')
+                if current_status == 'stopped':
+                    await interaction.followup.send(embed=create_info_embed("Already Stopped", f"VPS `{container_name}` is already stopped."), ephemeral=True)
+                    return
+                
                 await execute_lxc(container_name, f"stop {container_name}", timeout=120, node_id=node_id)
                 target_vps["status"] = "stopped"
-                save_vps_data()
+                save_vps_data_immediate()
                 await interaction.followup.send(embed=create_success_embed("VPS Stopped", f"VPS `{container_name}` has been stopped!"), ephemeral=True)
             except Exception as e:
-                await interaction.followup.send(embed=create_error_embed("Stop Failed", str(e)), ephemeral=True)
+                # If error is "not running", update status
+                error_str = str(e).lower()
+                if "not running" in error_str or "is not running" in error_str:
+                    target_vps["status"] = "stopped"
+                    save_vps_data_immediate()
+                    await interaction.followup.send(embed=create_success_embed("VPS Stopped", f"VPS `{container_name}` is stopped!"), ephemeral=True)
+                else:
+                    await interaction.followup.send(embed=create_error_embed("Stop Failed", str(e)), ephemeral=True)
         elif action == 'tmate':
             if suspended:
                 await interaction.followup.send(embed=create_error_embed("Access Denied", "Cannot access suspended VPS."), ephemeral=True)
                 return
-            await interaction.followup.send(embed=create_info_embed("SSH Access", "Generating SSH connection..."), ephemeral=True)
+            await interaction.followup.send(embed=create_info_embed("🔑 SSH Access", "Installing tmate and generating SSH link…"), ephemeral=True)
             try:
-                # Check if tmate is installed
-                try:
-                    await execute_lxc(container_name, f"exec {container_name} -- which tmate", node_id=node_id)
-                except:
-                    await interaction.followup.send(embed=create_info_embed("Installing SSH", "Installing tmate..."), ephemeral=True)
-                    await execute_lxc(container_name, f"exec {container_name} -- apt-get update -y", node_id=node_id)
-                    await execute_lxc(container_name, f"exec {container_name} -- apt-get install tmate -y", node_id=node_id)
-                    await interaction.followup.send(embed=create_success_embed("Installed", "SSH service installed!"), ephemeral=True)
-                session_name = f"{BOT_NAME.lower()}-session-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                await execute_lxc(container_name, f"exec {container_name} -- tmate -S /tmp/{session_name}.sock new-session -d", node_id=node_id)
-                await asyncio.sleep(3)
-                ssh_output = await execute_lxc(container_name, f"exec {container_name} -- tmate -S /tmp/{session_name}.sock display -p '#{{tmate_ssh}}'", node_id=node_id)
-                ssh_url = ssh_output.strip()
+                current_status = target_vps.get('status', 'stopped')
+                if current_status != 'running':
+                    await interaction.followup.send(embed=create_error_embed("VPS Not Running", "Start the VPS before accessing SSH."), ephemeral=True)
+                    return
+
+                node = get_node(node_id)
+
+                async def run_shell(cmd: str, timeout: int = 120) -> tuple:
+                    """Run a shell command, return (stdout, stderr, returncode)."""
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    try:
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        stdout, stderr = b"", b"timeout"
+                    return stdout.decode(), stderr.decode(), proc.returncode
+
+                cn = container_name  # shorthand
+
+                if node and node['is_local']:
+                    # Step 1: install tmate inside the container
+                    _, _, rc = await run_shell(
+                        f"lxc exec {cn} -- bash -c 'apt-get update -qq -y && apt-get install -y tmate'",
+                        timeout=120
+                    )
+                    if rc != 0:
+                        await interaction.followup.send(embed=create_error_embed("Install Failed", "Could not install tmate. Check VPS internet access."), ephemeral=True)
+                        return
+
+                    # Step 2: start a tmate session and grab the SSH link
+                    session_name = f"vps-{cn}-{datetime.now().strftime('%H%M%S')}"
+                    sock = f"/tmp/{session_name}.sock"
+
+                    await run_shell(f"lxc exec {cn} -- tmate -S {sock} new-session -d -s {session_name}", timeout=15)
+                    await asyncio.sleep(3)
+                    stdout, _, _ = await run_shell(
+                        f"lxc exec {cn} -- tmate -S {sock} display -p '#{{tmate_ssh}}'",
+                        timeout=10
+                    )
+                    ssh_url = stdout.strip()
+                else:
+                    # Remote node fallback via execute_lxc (uses requests)
+                    try:
+                        await execute_lxc(
+                            cn,
+                            f"exec {cn} -- bash -c 'apt-get update -qq -y && apt-get install -y tmate'",
+                            node_id=node_id, timeout=120
+                        )
+                    except Exception as e:
+                        await interaction.followup.send(embed=create_error_embed("Install Failed", str(e)), ephemeral=True)
+                        return
+                    session_name = f"vps-{cn}-{datetime.now().strftime('%H%M%S')}"
+                    sock = f"/tmp/{session_name}.sock"
+                    try:
+                        await execute_lxc(cn, f"exec {cn} -- tmate -S {sock} new-session -d -s {session_name}", node_id=node_id, timeout=15)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3)
+                    try:
+                        raw = await execute_lxc(cn, f"exec {cn} -- tmate -S {sock} display -p '#{{tmate_ssh}}'", node_id=node_id, timeout=10)
+                        ssh_url = raw.strip() if isinstance(raw, str) else ""
+                    except Exception:
+                        ssh_url = ""
+
                 if ssh_url:
                     try:
-                        ssh_embed = create_embed("🔑 SSH Access", f"SSH connection for VPS `{container_name}`:", 0x00ff88)
+                        ssh_embed = create_embed("🔑 SSH Access", f"tmate SSH link for VPS `{cn}`:", 0x00ff88)
                         add_field(ssh_embed, "Command", f"```{ssh_url}```", False)
                         add_field(ssh_embed, "⚠️ Security", "This link is temporary. Do not share it.", False)
-                        add_field(ssh_embed, "📝 Session", f"Session ID: {session_name}", False)
                         await interaction.user.send(embed=ssh_embed)
-                        await interaction.followup.send(embed=create_success_embed("SSH Sent", f"Check your DMs for SSH link! Session: {session_name}"), ephemeral=True)
+                        await interaction.followup.send(embed=create_success_embed("✅ SSH Sent", "Check your DMs for the SSH link!"), ephemeral=True)
                     except discord.Forbidden:
-                        await interaction.followup.send(embed=create_error_embed("DM Failed", "Enable DMs to receive SSH link!"), ephemeral=True)
-                else:
-                    await interaction.followup.send(embed=create_error_embed("SSH Failed", "No SSH URL generated."), ephemeral=True)
+                        await interaction.followup.send(embed=create_error_embed("DM Failed", "Enable DMs to receive the SSH link!"), ephemeral=True)
+                    else:
+                        await interaction.followup.send(embed=create_success_embed("✅ SSH Sent", "Check your DMs for the SSH link!"), ephemeral=True)
             except Exception as e:
-                await interaction.followup.send(embed=create_error_embed("SSH Error", str(e)), ephemeral=True)
+                await interaction.followup.send(embed=create_error_embed("SSH Failed", str(e)), ephemeral=True)
+                
+        elif action == 'sshx':
+            if suspended:
+                await interaction.followup.send(embed=create_error_embed("Access Denied", "Cannot access suspended VPS."), ephemeral=True)
+                return
+            try:
+                current_status = target_vps.get('status', 'stopped')
+                if current_status != 'running':
+                    await interaction.followup.send(embed=create_error_embed("VPS Not Running", "Start the VPS before using SSHX."), ephemeral=True)
+                    return
+                await interaction.followup.send(embed=create_info_embed("🌐 SSHX", "Generating SSHX link… please wait ~6 seconds."), ephemeral=True)
+
+                cn = container_name
+                node = get_node(node_id)
+
+                async def shell(cmd: str, timeout: int = 120) -> tuple:
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    try:
+                        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except Exception:
+                            pass
+                        out, err = b"", b""
+                    return (out or b"").decode(errors="ignore"), (err or b"").decode(errors="ignore"), proc.returncode
+
+                def extract_sshx_link(text: str) -> str:
+                    for line in text.splitlines():
+                        for part in line.split():
+                            if "sshx.io/s/" in part:
+                                return part.strip().rstrip(".,;")
+                    return ""
+
+                if node and node['is_local']:
+                    # Step 1: Check if sshx already installed
+                    check_out, _, check_rc = await shell(
+                        f"lxc exec {cn} -- bash -c 'command -v sshx || ls /root/.local/bin/sshx 2>/dev/null || ls /usr/local/bin/sshx 2>/dev/null'",
+                        timeout=10
+                    )
+                    sshx_bin = check_out.strip().splitlines()[0].strip() if check_out.strip() else ""
+
+                    if not sshx_bin:
+                        # Not installed — install now
+                        out_i, err_i, rc = await shell(
+                            f"lxc exec {cn} -- bash -c "
+                            f"'apt-get install -y curl 2>/dev/null; curl -sSf https://sshx.io/get | sh'",
+                            timeout=90
+                        )
+                        if rc != 0 and "sshx" not in (out_i + err_i).lower():
+                            logger.warning(f"SSHX install may have failed for {cn}: rc={rc} err={err_i[:300]}")
+                        # Re-check path after install
+                        check_out2, _, _ = await shell(
+                            f"lxc exec {cn} -- bash -c 'command -v sshx || ls /root/.local/bin/sshx 2>/dev/null || ls /usr/local/bin/sshx 2>/dev/null'",
+                            timeout=10
+                        )
+                        sshx_bin = check_out2.strip().splitlines()[0].strip() if check_out2.strip() else "sshx"
+
+                    # Step 2: Run sshx and grab link
+                    cmd = (
+                        f"lxc exec {cn} -- bash -c "
+                        f"\"script -qc '{sshx_bin}' /dev/null\""
+                    )
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT
+                    )
+                                        # Step 2: First try to grab existing sshx link from state file
+                    sshx_link = ""
+                    grep_out, _, _ = await shell(
+                        f"lxc exec {cn} -- bash -c "
+                        f"'grep -aho \"https://sshx.io/s/[A-Za-z0-9#=_-]*\" /root/.sshx/* 2>/dev/null | head -n1'",
+                        timeout=5
+                    )
+                    sshx_link = extract_sshx_link(grep_out)
+
+                    if not sshx_link:
+                        # Start sshx in background and wait for state file
+                        await shell(
+                            f"lxc exec {cn} -- bash -c "
+                            f"'nohup {sshx_bin} > /tmp/sshx.log 2>&1 &'",
+                            timeout=10
+                        )
+                        # Wait for link to appear in log
+                        for _ in range(10):
+                            await asyncio.sleep(1)
+                            grep_out2, _, _ = await shell(
+                                f"lxc exec {cn} -- bash -c "
+                                f"'grep -aho \"https://sshx.io/s/[A-Za-z0-9#=_-]*\" /tmp/sshx.log 2>/dev/null | head -n1'",
+                                timeout=5
+                            )
+                            sshx_link = extract_sshx_link(grep_out2)
+                            if sshx_link:
+                                break
+                else:
+                    # Remote node
+                    try:
+                        await execute_lxc(
+                            cn,
+                            f"exec {cn} -- bash -c 'command -v sshx || (apt-get install -y curl 2>/dev/null; curl -sSf https://sshx.io/get | sh)'",
+                            node_id=node_id, timeout=90
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        raw = await execute_lxc(
+                            cn,
+                            f"exec {cn} -- bash -c \"script -qc 'sshx' /dev/null\"",
+                            node_id=node_id, timeout=20
+                        )
+                        sshx_link = extract_sshx_link(raw if isinstance(raw, str) else "")
+                    except Exception:
+                        sshx_link = ""
+                    if not sshx_link:
+                        try:
+                            raw2 = await execute_lxc(
+                                cn,
+                                f"exec {cn} -- bash -c "
+                                f"'grep -aho \"https://sshx.io/s/[A-Za-z0-9#=_-]*\" /root/.sshx/* 2>/dev/null | head -n1'",
+                                node_id=node_id, timeout=10
+                            )
+                            sshx_link = extract_sshx_link(raw2 if isinstance(raw2, str) else "")
+                        except Exception:
+                            pass
+
+                if sshx_link:
+                    try:
+                        sshx_embed = create_embed("🌐 SSHX Link", f"SSHX web terminal for VPS `{cn}`:", 0x7289da)
+                        add_field(sshx_embed, "🔗 Link", f"`{sshx_link}`", False)
+                        add_field(sshx_embed, "⚠️ Note", "This link gives full terminal access. Do not share it.", False)
+                        await interaction.user.send(embed=sshx_embed)
+                        await interaction.followup.send(embed=create_success_embed("✅ SSHX Sent", "Check your DMs for the SSHX link!"), ephemeral=True)
+                    except discord.Forbidden:
+                        await interaction.followup.send(embed=create_error_embed("DM Failed", "Enable DMs to receive the SSHX link!"), ephemeral=True)
+                else:
+                    await interaction.followup.send(embed=create_error_embed("SSHX Failed", "Could not retrieve SSHX link. Make sure the VPS has internet access and try again."), ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(embed=create_error_embed("SSHX Error", str(e)), ephemeral=True)
+        elif action == 'regen_password':
+            if suspended:
+                await interaction.followup.send(embed=create_error_embed("Access Denied", "Cannot regenerate password for suspended VPS."), ephemeral=True)
+                return
+            try:
+                # Generate new strong password
+                new_password = generate_strong_password()
+                
+                # Configure SSH and set new password
+                success, result = await configure_ssh(container_name, node_id, new_password)
+                if success:
+                    password_embed = create_success_embed("Password Regenerated", f"New root password generated for `{container_name}`")
+                    add_field(password_embed, "🔐 New Password", f"`{new_password}`\n*Save this password securely!*", False)
+                    add_field(password_embed, "ℹ️ Note", "You can now SSH into your VPS with the new password.", False)
+                    await interaction.followup.send(embed=password_embed, ephemeral=True)
+                else:
+                    await interaction.followup.send(embed=create_error_embed("Regen Failed", str(result)), ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(embed=create_error_embed("Error", f"Failed to regenerate password: {str(e)}"), ephemeral=True)
         new_embed = await self.create_vps_embed(self.selected_index)
         await interaction.edit_original_response(embed=new_embed, view=self)
 
@@ -1505,30 +2620,64 @@ async def get_node_status(node_id: int) -> str:
         return "❓ Unknown"
     if node['is_local']:
         return "🟢 Online (Local)"
+    # Remote nodes - check connectivity but don't spam errors
     try:
         response = requests.get(f"{node['url']}/api/ping", params={'api_key': node['api_key']}, timeout=5)
         if response.status_code == 200:
             return "🟢 Online"
         else:
-            return "🔴 Offline"
-    except Exception as e:
-        logger.error(f"Failed to ping node {node['name']}: {e}")
+            return "🔴 Offline (Network unreachable)"
+    except requests.exceptions.ConnectionError:
+        return "🔴 Unreachable (Network issue)"
+    except requests.exceptions.Timeout:
+        return "🔴 No response"
+    except Exception:
         return "🔴 Offline"
 
 
 def get_host_disk_usage():
+    """Get host disk usage - cross-platform compatible"""
     try:
-        result = subprocess.run(['df', '-h', '/'], capture_output=True, text=True)
-        lines = result.stdout.splitlines()
-        if len(lines) > 1:
-            parts = lines[1].split()
-            total = parts[1]
-            used = parts[2]
-            perc = parts[4]
-            return f"{used}/{total} ({perc})"
-        return "Unknown"
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            # Windows: Use wmic or psutil
+            try:
+                import psutil
+                disk = psutil.disk_usage('/')
+                return f"{disk.used // (1024**3)} GB / {disk.total // (1024**3)} GB ({disk.percent}%)"
+            except ImportError:
+                # Fallback for Windows without psutil
+                try:
+                    result = subprocess.run(['wmic', 'LogicalDisk', 'get', 'Size,FreeSpace'], 
+                                          capture_output=True, text=True, timeout=5)
+                    lines = result.stdout.strip().split('\n')
+                    if len(lines) > 1:
+                        values = lines[1].split()
+                        if len(values) >= 2:
+                            size = int(values[0]) // (1024**3)
+                            free = int(values[1]) // (1024**3)
+                            used = size - free
+                            percent = (used / size * 100) if size > 0 else 0
+                            return f"{used} GB / {size} GB ({percent:.0f}%)"
+                except:
+                    pass
+                return "Unknown"
+        else:
+            # Linux/Unix: Use df command
+            result = subprocess.run(['df', '-h', '/'], capture_output=True, text=True, timeout=10)
+            lines = result.stdout.splitlines()
+            if len(lines) > 1:
+                parts = lines[1].split()
+                if len(parts) >= 5:
+                    used = parts[2]
+                    size = parts[1]
+                    perc = parts[4]
+                    return f"{used}/{size} ({perc})"
+            return "Unknown"
     except Exception as e:
-        logger.error(f"Error getting disk usage: {e}")
+        logger.debug(f"Error getting disk usage: {e}")
         return "Unknown"
 
 
@@ -1551,7 +2700,8 @@ async def get_host_stats(node_id: int) -> Dict:
             stats['disk'] = stats.get('disk', 'Unknown')
             return stats
         except Exception as e:
-            logger.error(f"Failed to get host stats from node {node['name']}: {e}")
+            # Remote node unreachable - don't spam error logs
+            logger.debug(f"Remote node {node['name']} stats unavailable: {type(e).__name__}")
             return {"cpu": 0.0, "ram": 0.0, "disk": "Unknown"}
 
 
@@ -1633,7 +2783,22 @@ async def vps_list(ctx, node_id: int = 1):
         if vps.get('whitelisted', False):
             vps_status += " (WHITELISTED)"
         config = vps.get('config', 'Custom')
-        vps_info.append(f"{status_emoji} **{i}.** {username} • `{vps['container_name']}`\n _{vps_status} | {config}_")
+        
+        # Add expiration info
+        expiration_info = ""
+        if vps.get('expiration_date'):
+            expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+            days_remaining = (expiration_dt - datetime.now()).days
+            if days_remaining < 0:
+                expiration_info = " | 🔴 EXPIRED"
+            elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                expiration_info = f" | 🟡 EXPIRES({days_remaining}d)"
+            else:
+                expiration_info = f" | 🟢 ({days_remaining}d)"
+        else:
+            expiration_info = " | ⏰ No exp"
+        
+        vps_info.append(f"{status_emoji} **{i}.** {username} • `{vps['container_name']}`\n _{vps_status} | {config}{expiration_info}_")
 
     # Create main embed (modern: gradient-inspired colors, clean typography)
     color = 0x10b981 if is_online else 0xef4444  # Teal green / Soft red for modern feel
@@ -1678,12 +2843,12 @@ async def vps_list(ctx, node_id: int = 1):
             )
             chunk_text = "\n".join(chunk)
             add_field(page_embed, "📋 **VPS List**", f"```{chunk_text}```", False)
-            page_embed.set_footer(text=f"Total: {total_vps} VPS | Powered by Your Bot")
+            page_embed.set_footer(text=f"Made by Hopingboyz • {len(vps_info)} VPS shown")
             await ctx.send(embed=page_embed)
     else:
         add_field(embed, "📋 **VPS List**", "No deployments yet. Launch one! 🚀", False)
 
-    embed.set_footer(text=f"Refresh with !vps-list {node_id} | {len(vps_info)} shown")
+    embed.set_footer(text=f"Made by Hopingboyz • Total: {len(vps_info)} VPS")
     await ctx.send(embed=embed)
 
 @bot.command(name='list-all')
@@ -1720,7 +2885,22 @@ async def list_all_vps(ctx):
                     status_text += " (SUSPENDED)"
                 if vps.get('whitelisted', False):
                     status_text += " (WHITELISTED)"
-                vps_info.append(f"{status_emoji} **{user.name}** - VPS {i+1}: `{vps['container_name']}` - {vps.get('config', 'Custom')} - {status_text} (Node: {node_name})")
+                
+                # Add expiration info
+                expiration_text = ""
+                if vps.get('expiration_date'):
+                    expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+                    days_remaining = (expiration_dt - datetime.now()).days
+                    if days_remaining < 0:
+                        expiration_text = " • 🔴 EXPIRED"
+                    elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                        expiration_text = f" • 🟡 EXPIRING({days_remaining}d)"
+                    else:
+                        expiration_text = f" • 🟢 ({days_remaining}d)"
+                else:
+                    expiration_text = " • ⏰ No exp"
+                
+                vps_info.append(f"{status_emoji} **{user.name}** - VPS {i+1}: `{vps['container_name']}` - {vps.get('config', 'Custom')} - {status_text} (Node: {node_name}){expiration_text}")
         except discord.NotFound:
             vps_info.append(f"❓ Unknown User ({user_id}) - {len(vps_list)} VPS")
     embed = create_embed("All VPS Information", "Complete overview of all VPS deployments and user statistics", 0x1a1a1a)
@@ -1926,6 +3106,46 @@ async def ports_command(ctx, subcmd: str = None, *args):
     else:
         await ctx.send(embed=create_error_embed("Invalid Subcommand", f"Use: add <vps_num> <port>, list, remove <id>"))
 
+class ConfirmDeleteView(discord.ui.View):
+    """Confirmation dialog for VPS deletion"""
+    def __init__(self, admin_id: str, vps_id: int, container_name: str, vps_number: int):
+        super().__init__(timeout=60)  # 60 seconds to confirm
+        self.admin_id = admin_id  # Admin who initiated the delete command
+        self.vps_id = vps_id
+        self.container_name = container_name
+        self.vps_number = vps_number
+        self.confirmed = False
+    
+    @discord.ui.button(label="✅ Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Allow only the admin who initiated the delete command to confirm
+        if str(interaction.user.id) != self.admin_id:
+            await interaction.response.send_message(
+                embed=create_error_embed("Access Denied", "Only the admin who initiated the deletion can confirm!"),
+                ephemeral=True
+            )
+            return
+        
+        self.confirmed = True
+        await interaction.response.defer()
+        self.stop()
+    
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Allow only the admin who initiated the delete command to cancel
+        if str(interaction.user.id) != self.admin_id:
+            await interaction.response.send_message(
+                embed=create_error_embed("Access Denied", "Only the admin who initiated the deletion can cancel!"),
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.send_message(
+            embed=create_info_embed("Deletion Cancelled", f"VPS deletion for {self.container_name} has been cancelled."),
+            ephemeral=True
+        )
+        self.stop()
+
 @bot.command(name='delete-vps')
 @is_admin()
 async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str = "No reason"):
@@ -1940,11 +3160,34 @@ async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str 
 
     vps = vps_data[user_id][vps_number - 1]
     container_name = vps["container_name"]
+    vps_id = vps.get("id", vps_number)
     node_id = vps.get("node_id", 1)
 
+    # Create confirmation embed with clearer info
+    confirm_embed = create_embed("⚠️ Confirm VPS Deletion", f"Are you sure you want to delete this VPS?", 0xff3366)
+    add_field(confirm_embed, "VPS Details", 
+        f"**VPS ID:** #{vps_id}\n"
+        f"**Container:** `{container_name}`\n"
+        f"**Owner:** {user.mention}\n"
+        f"**Config:** {vps.get('config', 'Custom')}\n"
+        f"**Status:** {vps.get('status', 'unknown').upper()}", 
+        False)
+    add_field(confirm_embed, "Action", "Click **✅ Confirm Delete** to permanently delete this VPS, or **❌ Cancel** to abort.", False)
+    add_field(confirm_embed, "Reason", reason, False)
+    
+    confirmation_view = ConfirmDeleteView(str(ctx.author.id), vps_id, container_name, vps_number)
+    confirmation_msg = await ctx.send(embed=confirm_embed, view=confirmation_view)
+    
+    # Wait for confirmation
+    await confirmation_view.wait()
+    
+    if not confirmation_view.confirmed:
+        return  # User cancelled or timeout
+    
+    # Proceed with deletion
     await ctx.send(embed=create_info_embed(
-        "Deleting VPS",
-        f"Removing VPS #{vps_number} for {user.mention}..."
+        "🗑️ Deleting VPS",
+        f"Removing VPS #{vps_id} for {user.mention}..."
     ))
 
     node_result = "Not checked"
@@ -1960,7 +3203,7 @@ async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str 
         else:
             node_result = f"Container delete failed: {e}"
 
-    # 2️⃣ DELETE FROM DATABASE (THIS IS THE FIX)
+    # 2️⃣ DELETE FROM DATABASE
     conn = get_db()
     cur = conn.cursor()
 
@@ -1987,9 +3230,9 @@ async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str 
     save_vps_data()
 
     # 4️⃣ Success embed
-    embed = create_success_embed("🌟 UnixNodes - VPS Deleted Successfully")
+    embed = create_success_embed("✅ VPS Deleted Successfully")
+    add_field(embed, "VPS ID", f"#{vps_id}", True)
     add_field(embed, "Owner", user.mention, True)
-    add_field(embed, "VPS Number", f"#{vps_number}", True)
     add_field(embed, "Container", container_name, False)
     add_field(embed, "Node Result", node_result, False)
     add_field(embed, "Reason", reason, False)
@@ -2189,62 +3432,105 @@ async def system_status(ctx):
             status = "🟢 Online"
             running_nodes += 1
             
-            # Get local resources (approximate)
+            # Get local resources (approximate) - cross-platform
             try:
-                # Get system memory
-                mem_result = subprocess.run(['free', '-m'], capture_output=True, text=True)
-                mem_lines = mem_result.stdout.splitlines()
-                if len(mem_lines) > 1:
-                    mem = mem_lines[1].split()
-                    total_ram_mb = int(mem[1])
-                    used_ram_mb = int(mem[2])
-                    free_ram_mb = total_ram_mb - used_ram_mb
-                    total_ram_gb = total_ram_mb / 1024
-                    free_ram_gb = free_ram_mb / 1024
+                import platform
+                system = platform.system()
+                
+                if system == "Windows":
+                    # Windows: Use psutil
+                    try:
+                        import psutil
+                        mem = psutil.virtual_memory()
+                        total_ram_gb = mem.total / (1024**3)
+                        free_ram_gb = mem.available / (1024**3)
+                        
+                        cpu_count = psutil.cpu_count()
+                        total_cpu = cpu_count if cpu_count else 0
+                        
+                        disk = psutil.disk_usage('C:\\' if 'C:\\' else '/')
+                        total_disk = disk.total / (1024**3)
+                    except ImportError:
+                        # Fallback for Windows without psutil
+                        try:
+                            result = subprocess.run(['wmic', 'OS', 'get', 'TotalVisibleMemorySize,FreePhysicalMemory'], 
+                                                  capture_output=True, text=True, timeout=5)
+                            lines = result.stdout.strip().split('\n')
+                            if len(lines) > 1:
+                                values = lines[1].split()
+                                total_ram_gb = int(values[0]) / (1024**2)
+                                free_ram_gb = int(values[1]) / (1024**2)
+                            else:
+                                total_ram_gb = 0
+                                free_ram_gb = 0
+                            
+                            result = subprocess.run(['wmic', 'os', 'get', 'numberofprocessors'], 
+                                                  capture_output=True, text=True, timeout=5)
+                            total_cpu = int(result.stdout.strip().split('\n')[-1]) if result.stdout else 0
+                            
+                            total_disk = 0  # Approximate
+                        except:
+                            total_ram_gb = 0
+                            free_ram_gb = 0
+                            total_cpu = 0
+                            total_disk = 0
                 else:
-                    total_ram_gb = 0
-                    free_ram_gb = 0
-                
-                # Get CPU cores
-                cpu_result = subprocess.run(['nproc'], capture_output=True, text=True)
-                total_cpu = int(cpu_result.stdout.strip()) if cpu_result.stdout.strip() else 0
-                
-                # Get disk space
-                disk_result = subprocess.run(['df', '-h', '/'], capture_output=True, text=True)
-                disk_lines = disk_result.stdout.splitlines()
-                if len(disk_lines) > 1:
-                    disk_parts = disk_lines[1].split()
-                    total_disk_str = disk_parts[1]
-                    # Convert to GB
-                    if 'T' in total_disk_str:
-                        total_disk = float(total_disk_str.replace('T', '')) * 1024
-                    elif 'G' in total_disk_str:
-                        total_disk = float(total_disk_str.replace('G', ''))
-                    elif 'M' in total_disk_str:
-                        total_disk = float(total_disk_str.replace('M', '')) / 1024
+                    # Linux/Unix: Use traditional commands
+                    # Get system memory
+                    mem_result = subprocess.run(['free', '-m'], capture_output=True, text=True, timeout=10)
+                    mem_lines = mem_result.stdout.splitlines()
+                    if len(mem_lines) > 1:
+                        mem = mem_lines[1].split()
+                        total_ram_mb = int(mem[1])
+                        used_ram_mb = int(mem[2])
+                        free_ram_mb = total_ram_mb - used_ram_mb
+                        total_ram_gb = total_ram_mb / 1024
+                        free_ram_gb = free_ram_mb / 1024
+                    else:
+                        total_ram_gb = 0
+                        free_ram_gb = 0
+                    
+                    # Get CPU cores
+                    cpu_result = subprocess.run(['nproc'], capture_output=True, text=True, timeout=10)
+                    total_cpu = int(cpu_result.stdout.strip()) if cpu_result.stdout.strip() else 0
+                    
+                    # Get disk space
+                    disk_result = subprocess.run(['df', '-h', '/'], capture_output=True, text=True, timeout=10)
+                    disk_lines = disk_result.stdout.splitlines()
+                    if len(disk_lines) > 1:
+                        disk_parts = disk_lines[1].split()
+                        total_disk_str = disk_parts[1]
+                        # Convert to GB
+                        if 'T' in total_disk_str:
+                            total_disk = float(total_disk_str.replace('T', '')) * 1024
+                        elif 'G' in total_disk_str:
+                            total_disk = float(total_disk_str.replace('G', ''))
+                        elif 'M' in total_disk_str:
+                            total_disk = float(total_disk_str.replace('M', '')) / 1024
+                        else:
+                            total_disk = 0
                     else:
                         total_disk = 0
-                else:
-                    total_disk = 0
                 
                 # Calculate free resources (simplified - actual would need more complex logic)
-                free_cpu = max(0, total_cpu - (total_cpu_allocated // total_nodes))  # Approximate
-                free_disk = max(0, total_disk - (total_disk_allocated // total_nodes))  # Approximate
+                free_cpu = max(0, total_cpu - (total_cpu_allocated // total_nodes)) if total_nodes > 0 else 0
+                free_disk = max(0, total_disk - (total_disk_allocated // total_nodes)) if total_nodes > 0 else 0
                 
                 # Update totals
-                total_node_ram_allocated += total_ram_gb - free_ram_gb
-                total_node_cpu_allocated += total_cpu - free_cpu
-                total_node_disk_allocated += total_disk - free_disk
-                total_node_ram_free += free_ram_gb
-                total_node_cpu_free += free_cpu
-                total_node_disk_free += free_disk
+                if total_ram_gb > 0:
+                    total_node_ram_allocated += total_ram_gb - free_ram_gb
+                    total_node_ram_free += free_ram_gb
+                if total_cpu > 0:
+                    total_node_cpu_allocated += total_cpu - free_cpu
+                    total_node_cpu_free += free_cpu
+                if total_disk > 0:
+                    total_node_disk_allocated += total_disk - free_disk
+                    total_node_disk_free += free_disk
                 
             except Exception as e:
-                logger.error(f"Error getting local node resources: {e}")
+                logger.debug(f"Error getting local node resources: {e}")
                 status = "⚠️ Unknown"
-                total_node_ram_free = 0
-                total_node_cpu_free = 0
-                total_node_disk_free = 0
+                # Don't reset to 0, just skip this node's resources
         else:
             # Check remote node status
             try:
@@ -2335,6 +3621,33 @@ async def system_status(ctx):
             title = "📡 Node Details" if idx == 1 else f"📡 Node Details (Part {idx})"
             add_field(embed, title, chunk, False)
     
+    # Expiration Status Section
+    expiring_soon_count = 0
+    expired_count = 0
+    active_exp_count = 0
+    no_exp_count = 0
+    
+    for user_id, vps_list in vps_data.items():
+        for vps in vps_list:
+            if vps.get('expiration_date'):
+                expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+                days_remaining = (expiration_dt - datetime.now()).days
+                if days_remaining < 0:
+                    expired_count += 1
+                elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                    expiring_soon_count += 1
+                else:
+                    active_exp_count += 1
+            else:
+                no_exp_count += 1
+    
+    add_field(embed, "⏰ VPS Expiration Status",
+        f"**🟢 Active:** {active_exp_count} VPS\n"
+        f"**🟡 Expiring Soon:** {expiring_soon_count} VPS\n"
+        f"**🔴 Expired:** {expired_count} VPS\n"
+        f"**🔵 No Expiration:** {no_exp_count} VPS",
+        True)
+    
     # System Health Indicator
     health_status = "✅ Excellent"
     health_color = 0x00ff88
@@ -2352,8 +3665,8 @@ async def system_status(ctx):
     add_field(embed, "🏥 System Health", health_status, False)
     
     # Footer with current time
-    embed.set_footer(text=f"{BOT_NAME} System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    icon_url="https://i.imgur.com/Tv3clt0.jpeg")
+    embed.set_footer(text=f"Made by Hopingboyz • System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    icon_url=BOT_ICON_URL)
     
     await ctx.send(embed=embed)
 
@@ -2539,7 +3852,8 @@ async def user_info(ctx, user: discord.Member):
             vps_lines.append(
                 f"**{i}.** `{vps['container_name']}`\n"
                 f"{status} | `{ram}GB` RAM • `{cpu}` CPU • `{storage}GB` Disk\n"
-                f"📍 Node: `{node_name}`"
+                f"📍 Node: `{node_name}`" + 
+                (f"\n⏰ {('🔴 EXPIRED' if (datetime.fromisoformat(vps['expiration_date']) - datetime.now()).days < 0 else '🟡 EXPIRING' if (datetime.fromisoformat(vps['expiration_date']) - datetime.now()).days <= EXPIRATION_WARNING_DAYS else '🟢 ACTIVE')} • {(datetime.fromisoformat(vps['expiration_date']).strftime('%Y-%m-%d'))} ({max(0, (datetime.fromisoformat(vps['expiration_date']) - datetime.now()).days)}d)" if vps.get('expiration_date') else "\n⏰ No expiration set")
             )
 
         # ─── Row 2 : VPS Summary ────────────────────────────────
@@ -2589,7 +3903,7 @@ async def user_info(ctx, user: discord.Member):
             inline=False
         )
 
-    embed.set_footer(text="UnixNodes • User Resource Dashboard")
+    embed.set_footer(text="Made by Hopingboyz • User Resource Dashboard")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -2687,7 +4001,38 @@ async def server_stats(ctx):
         inline=True
     )
 
+    # ─── Expiration Counts ─────────────────────────────────────
+    expiring_soon_count = 0
+    expired_count = 0
+    active_exp_count = 0
+    no_exp_count = 0
+    
+    for vps_list in vps_data.values():
+        for vps in vps_list:
+            if vps.get('expiration_date'):
+                expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+                days_remaining = (expiration_dt - datetime.now()).days
+                if days_remaining < 0:
+                    expired_count += 1
+                elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                    expiring_soon_count += 1
+                else:
+                    active_exp_count += 1
+            else:
+                no_exp_count += 1
+
     # ── Row 3 ──────────────────────────────────────────────────
+    embed.add_field(
+        name="⏰ Expiration",
+        value=(
+            f"🟢 `{active_exp_count}` Active\n"
+            f"🟡 `{expiring_soon_count}` Expiring Soon\n"
+            f"🔴 `{expired_count}` Expired\n"
+            f"🔵 `{no_exp_count}` No Exp"
+        ),
+        inline=True
+    )
+
     embed.add_field(
         name="🌐 Ports Allocated",
         value=f"`{total_ports_allocated}`",
@@ -2700,8 +4045,11 @@ async def server_stats(ctx):
         inline=True
     )
 
+    # ── Row 4 ──────────────────────────────────────────────────
+
+    # ── Row 4 ──────────────────────────────────────────────────
     embed.add_field(
-        name="📊 Utilization",
+        name="📊 Port Utilization",
         value=(
             f"`{total_ports_used}/{total_ports_allocated}`"
             if total_ports_allocated else "`N/A`"
@@ -2709,7 +4057,7 @@ async def server_stats(ctx):
         inline=True
     )
 
-    embed.set_footer(text="UnixNodes • Real-Time Monitoring")
+    embed.set_footer(text="Made by Hopingboyz • Real-Time Monitoring")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -2730,14 +4078,28 @@ async def vps_info(ctx, container_name: str = None):
                         status_text += " (SUSPENDED)"
                     if vps.get('whitelisted', False):
                         status_text += " (WHITELISTED)"
-                    all_vps.append(f"**{user.name}** - VPS {i+1}: `{vps['container_name']}` - {status_text} (Node: {node_name})")
+                    
+                    # Add expiration info
+                    expiration_text = ""
+                    if vps.get('expiration_date'):
+                        expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+                        days_remaining = (expiration_dt - datetime.now()).days
+                        if days_remaining < 0:
+                            expiration_text = " • 🔴 EXPIRED"
+                        elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                            expiration_text = f" • 🟡 EXPIRING ({days_remaining}d)"
+                        else:
+                            expiration_text = f" • 🟢 ({days_remaining}d)"
+                    
+                    all_vps.append(f"**{user.name}** - VPS {i+1}: `{vps['container_name']}` - {status_text} (Node: {node_name}){expiration_text}")
             except:
                 pass
         vps_text = "\n".join(all_vps)
         chunks = [vps_text[i:i+1024] for i in range(0, len(vps_text), 1024)]
         for idx, chunk in enumerate(chunks, 1):
-            embed = create_embed(f"🖥️ All VPS (Part {idx})", f"List of all VPS deployments", 0x1a1a1a)
-            add_field(embed, "VPS List", chunk, False)
+            embed = create_embed(f"🖥️ All VPS (Part {idx}/{len(chunks)})", f"Complete list of all VPS deployments with expiration status", 0x2ecc71)
+            add_field(embed, "VPS Inventory", chunk, False)
+            embed.set_footer(text=f"Made by Hopingboyz • VPS Information System")
             await ctx.send(embed=embed)
     else:
         found_vps = None
@@ -2755,30 +4117,97 @@ async def vps_info(ctx, container_name: str = None):
             return
         node = get_node(found_vps['node_id'])
         node_name = node['name'] if node else "Unknown"
+        
+        # Determine status color based on expiration and suspension
+        status_color = 0x1a1a1a
+        if found_vps.get('suspended', False):
+            status_color = 0xffaa00
+        elif found_vps.get('expiration_date'):
+            expiration_dt = datetime.fromisoformat(found_vps['expiration_date'])
+            days_remaining = (expiration_dt - datetime.now()).days
+            if days_remaining < 0:
+                status_color = 0xff3366
+            elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                status_color = 0xffaa00
+            else:
+                status_color = 0x2ecc71
+        
         suspended_text = " (SUSPENDED)" if found_vps.get('suspended', False) else ""
         whitelisted_text = " (WHITELISTED)" if found_vps.get('whitelisted', False) else ""
-        embed = create_embed(f"🖥️ VPS Information - {container_name}", f"Details for VPS owned by {found_user.mention}{suspended_text}{whitelisted_text} on node {node_name}", 0x1a1a1a)
-        add_field(embed, "👤 Owner", f"**Name:** {found_user.name}\n**ID:** {found_user.id}", False)
-        add_field(embed, "📊 Specifications", f"**RAM:** {found_vps['ram']}\n**CPU:** {found_vps['cpu']} Cores\n**Storage:** {found_vps['storage']}", False)
-        add_field(embed, "📈 Status", f"**Current:** {found_vps.get('status', 'unknown').upper()}{suspended_text}{whitelisted_text}\n**Suspended:** {found_vps.get('suspended', False)}\n**Whitelisted:** {found_vps.get('whitelisted', False)}\n**Created:** {found_vps.get('created_at', 'Unknown')}", False)
-        if 'config' in found_vps:
-            add_field(embed, "⚙️ Configuration", f"**Config:** {found_vps['config']}", False)
+        embed = create_embed(f"🖥️ VPS Information - {container_name}", f"Detailed VPS profile owned by {found_user.mention}{suspended_text}{whitelisted_text}", status_color)
+        
+        add_field(embed, "👤 Owner", f"**Name:** {found_user.name}\n**ID:** `{found_user.id}`\n**Mention:** {found_user.mention}", False)
+        
+        add_field(embed, "🌐 Location & Node", f"**Node:** {node_name}\n**Node Type:** {'� Local' if node.get('is_local') else '🌐 Remote'}\n**Node ID:** `{found_vps.get('node_id', 1)}`", True)
+        
+        add_field(embed, "�📊 Specifications", f"**RAM:** `{found_vps['ram']}`\n**CPU:** `{found_vps['cpu']}` Cores\n**Storage:** `{found_vps['storage']}`\n**Config:** {found_vps.get('config', 'Custom')}", True)
+        
+        # Status information
+        status_info = f"**Current Status:** `{found_vps.get('status', 'unknown').upper()}`\n"
+        status_info += f"**Suspended:** {'🟡 Yes' if found_vps.get('suspended', False) else '🟢 No'}\n"
+        status_info += f"**Whitelisted:** {'✅ Yes' if found_vps.get('whitelisted', False) else '❌ No'}\n"
+        status_info += f"**Created:** `{found_vps.get('created_at', 'Unknown')}`"
+        add_field(embed, "📈 Status", status_info, False)
+        
+        # Expiration information
+        if found_vps.get('expiration_date'):
+            expiration_dt = datetime.fromisoformat(found_vps['expiration_date'])
+            days_remaining = (expiration_dt - datetime.now()).days
+            
+            if days_remaining < 0:
+                exp_status = "🔴 EXPIRED"
+                exp_color = "FF3366"
+            elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                exp_status = "🟡 EXPIRING SOON"
+                exp_color = "FFAA00"
+            else:
+                exp_status = "🟢 ACTIVE"
+                exp_color = "2ECC71"
+            
+            exp_info = f"**Status:** {exp_status}\n"
+            exp_info += f"**Expires On:** `{expiration_dt.strftime('%Y-%m-%d %H:%M:%S')}`\n"
+            exp_info += f"**Days Remaining:** `{max(0, days_remaining)}` days\n"
+            exp_info += f"**Time Left:** `{max(0, days_remaining)} days` from today"
+            add_field(embed, "⏰ Expiration", exp_info, False)
+        else:
+            add_field(embed, "⏰ Expiration", f"**Status:** 🔵 No expiration date set\n**Action:** Use `{PREFIX}set-expiration` to configure", False)
+        
         if found_vps.get('shared_with'):
             shared_users = []
             for shared_id in found_vps['shared_with']:
                 try:
                     shared_user = await bot.fetch_user(int(shared_id))
-                    shared_users.append(f"• {shared_user.mention}")
+                    shared_users.append(f"• {shared_user.mention} (`{shared_id}`)")
                 except:
-                    shared_users.append(f"• Unknown User ({shared_id})")
+                    shared_users.append(f"• Unknown User (`{shared_id}`)")
             shared_text = "\n".join(shared_users)
-            add_field(embed, "🔗 Shared With", shared_text, False)
+            add_field(embed, "🔗 Shared Access", shared_text, False)
+        
+        # Port forwarding info
         conn = get_db()
         cur = conn.cursor()
         cur.execute('SELECT COUNT(*) FROM port_forwards WHERE vps_container = ?', (container_name,))
         port_count = cur.fetchone()[0]
+        cur.execute('SELECT * FROM port_forwards WHERE vps_container = ? LIMIT 5', (container_name,))
+        ports = cur.fetchall()
         conn.close()
-        add_field(embed, "🌐 Active Ports", f"{port_count} forwarded ports (TCP/UDP)", False)
+        
+        if port_count > 0:
+            port_info = f"**Total:** `{port_count}` forwarded ports (TCP & UDP)\n"
+            if ports:
+                port_info += "**Active Forwards:**\n"
+                for p in ports:
+                    port_info += f"  • `{p['host_port']}` → VPS:`{p['vps_port']}`\n"
+                if port_count > 5:
+                    port_info += f"  • ... +{port_count - 5} more"
+            add_field(embed, "🌐 Port Forwarding", port_info, False)
+        else:
+            add_field(embed, "🌐 Port Forwarding", "**Status:** No active port forwards", False)
+        
+        # OS information
+        add_field(embed, "🐧 Operating System", f"`{found_vps.get('os_version', 'ubuntu:22.04')}`", True)
+        
+        embed.set_footer(text=f"Made by Hopingboyz • VPS Information System • Container: {container_name}")
         await ctx.send(embed=embed)
 
 @bot.command(name='restart-vps')
@@ -3165,6 +4594,68 @@ async def vps_uptime(ctx, container_name: str):
     embed = create_info_embed("VPS Uptime", f"Uptime for `{container_name}`: {uptime}")
     await ctx.send(embed=embed)
 
+@bot.command(name='vps-password')
+@is_admin()
+async def vps_password(ctx, container_name: str = None):
+    """View or manage VPS root passwords"""
+    if not container_name:
+        # Show all passwords for all VPS
+        password_list = []
+        for user_id, vps_list in vps_data.items():
+            try:
+                user = await bot.fetch_user(int(user_id))
+                for vps in vps_list:
+                    password = vps.get('root_password', 'Not Set')
+                    if password == 'Not Set':
+                        password_display = "❌ Not Set"
+                    else:
+                        password_display = f"🔐 `{password}`"
+                    password_list.append(f"**{user.name}** - `{vps['container_name']}`: {password_display}")
+            except:
+                pass
+        
+        if not password_list:
+            await ctx.send(embed=create_info_embed("No Passwords", "No VPS passwords found in database."))
+            return
+        
+        password_text = "\n".join(password_list)
+        chunks = [password_text[i:i+1024] for i in range(0, len(password_text), 1024)]
+        for idx, chunk in enumerate(chunks, 1):
+            embed = create_embed(f"🔐 VPS Root Passwords (Part {idx}/{len(chunks)})", "Root passwords for all VPS", 0xff6b6b)
+            add_field(embed, "Passwords", chunk, False)
+            add_field(embed, "⚠️ Security Notice", "These passwords are sensitive. Do not share them publicly.", False)
+            embed.set_footer(text=f"Made by Hopingboyz • Password Management")
+            await ctx.send(embed=embed)
+    else:
+        # Show password for specific VPS
+        found_vps = None
+        found_user = None
+        for user_id, vps_list in vps_data.items():
+            for vps in vps_list:
+                if vps['container_name'] == container_name:
+                    found_vps = vps
+                    found_user = await bot.fetch_user(int(user_id))
+                    break
+            if found_vps:
+                break
+        
+        if not found_vps:
+            await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS found with container name: `{container_name}`"))
+            return
+        
+        password = found_vps.get('root_password', 'Not Set')
+        if password == 'Not Set':
+            embed = create_info_embed("Password Not Set", f"VPS `{container_name}` does not have a stored password.")
+        else:
+            embed = create_success_embed("VPS Password", f"Root password for VPS `{container_name}`")
+            add_field(embed, "Owner", f"{found_user.mention}", True)
+            add_field(embed, "Container", f"`{container_name}`", True)
+            add_field(embed, "🔐 Password", f"`{password}`", False)
+            add_field(embed, "Usage", f"SSH as `root` with this password", False)
+        
+        embed.set_footer(text=f"Made by Hopingboyz • Password Information")
+        await ctx.send(embed=embed)
+
 @bot.command(name='suspend-vps')
 @is_admin()
 async def suspend_vps(ctx, container_name: str, *, reason: str = "Admin action"):
@@ -3376,63 +4867,6 @@ async def whitelist_vps(ctx, container_name: str, action: str):
     if not found:
         await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
 
-@bot.command(name='snapshot')
-@is_admin()
-async def snapshot_vps(ctx, container_name: str, snap_name: str = "snap0"):
-    node_id = find_node_id_for_container(container_name)
-    await ctx.send(embed=create_info_embed("Creating Snapshot", f"Creating snapshot '{snap_name}' for `{container_name}`..."))
-    try:
-        await execute_lxc(container_name, f"snapshot {container_name} {snap_name}", node_id=node_id)
-        await ctx.send(embed=create_success_embed("Snapshot Created", f"Snapshot '{snap_name}' created for VPS `{container_name}`."))
-    except Exception as e:
-        await ctx.send(embed=create_error_embed("Snapshot Failed", f"Error: {str(e)}"))
-
-@bot.command(name='list-snapshots')
-@is_admin()
-async def list_snapshots(ctx, container_name: str):
-    node_id = find_node_id_for_container(container_name)
-    try:
-        result = await execute_lxc(container_name, f"snapshot list {container_name}", node_id=node_id)
-        embed = create_info_embed(f"Snapshots for {container_name}", result)
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(embed=create_error_embed("List Failed", f"Error: {str(e)}"))
-
-@bot.command(name='restore-snapshot')
-@is_admin()
-async def restore_snapshot(ctx, container_name: str, snap_name: str):
-    node_id = find_node_id_for_container(container_name)
-    await ctx.send(embed=create_warning_embed("Restore Snapshot", f"Restoring snapshot '{snap_name}' for `{container_name}` will overwrite current state. Continue?"))
-    class RestoreConfirm(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=60)
-
-        @discord.ui.button(label="Confirm Restore", style=discord.ButtonStyle.danger)
-        async def confirm(self, inter: discord.Interaction, item: discord.ui.Button):
-            await inter.response.defer()
-            try:
-                await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
-                await execute_lxc(container_name, f"restore {container_name} {snap_name}", node_id=node_id)
-                await execute_lxc(container_name, f"start {container_name}", node_id=node_id)
-                await apply_internal_permissions(container_name, node_id)
-                await recreate_port_forwards(container_name)
-                for uid, lst in vps_data.items():
-                    for vps in lst:
-                        if vps['container_name'] == container_name:
-                            vps['status'] = 'running'
-                            vps['suspended'] = False
-                            save_vps_data()
-                            break
-                await inter.followup.send(embed=create_success_embed("Snapshot Restored", f"Restored '{snap_name}' for VPS `{container_name}`."))
-            except Exception as e:
-                await inter.followup.send(embed=create_error_embed("Restore Failed", f"Error: {str(e)}"))
-
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-        async def cancel(self, inter: discord.Interaction, item: discord.ui.Button):
-            await inter.response.edit_message(embed=create_info_embed("Cancelled", "Snapshot restore cancelled."))
-
-    await ctx.send(view=RestoreConfirm())
-
 @bot.command(name='backup-db')
 @is_admin()
 async def backup_db(ctx):
@@ -3456,6 +4890,240 @@ async def repair_ports(ctx, container_name: str):
         await ctx.send(embed=create_success_embed("Ports Repaired", f"Re-added {readded} port forwards for `{container_name}`."))
     except Exception as e:
         await ctx.send(embed=create_error_embed("Repair Failed", f"Error: {str(e)}"))
+
+@bot.command(name='set-expiration')
+@is_admin()
+async def set_expiration(ctx, container_name: str, days: int):
+    """Set VPS expiration date (admin only)"""
+    if days <= 0:
+        await ctx.send(embed=create_error_embed("Invalid Days", "Days must be a positive number."))
+        return
+    
+    found_vps = None
+    user_id = None
+    vps_index = None
+    
+    for uid, vps_list in vps_data.items():
+        for i, vps in enumerate(vps_list):
+            if vps['container_name'] == container_name:
+                found_vps = vps
+                user_id = uid
+                vps_index = i
+                break
+        if found_vps:
+            break
+    
+    if not found_vps:
+        await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS found with container name: `{container_name}`"))
+        return
+    
+    # Calculate expiration date
+    expiration_date = (datetime.now() + timedelta(days=days)).isoformat()
+    found_vps['expiration_date'] = expiration_date
+    vps_data[user_id][vps_index] = found_vps
+    save_vps_data()
+    
+    # Get owner info
+    try:
+        owner = await bot.fetch_user(int(user_id))
+        owner_mention = owner.mention
+    except:
+        owner_mention = f"User {user_id}"
+    
+    embed = create_success_embed("Expiration Date Set", 
+        f"VPS `{container_name}` expiration date set for {days} days from now")
+    add_field(embed, "Owner", owner_mention, True)
+    add_field(embed, "Expires On", datetime.fromisoformat(expiration_date).strftime('%Y-%m-%d %H:%M:%S'), True)
+    add_field(embed, "Days Remaining", str(days), True)
+    
+    await ctx.send(embed=embed)
+    
+    # Notify owner
+    try:
+        owner = await bot.fetch_user(int(user_id))
+        dm_embed = create_info_embed("⏰ VPS Expiration Date Set",
+            f"Your VPS `{container_name}` will expire in {days} days.\n\n"
+            f"**Expires:** {datetime.fromisoformat(expiration_date).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Contact admin to renew your VPS before it expires.")
+        await owner.send(embed=dm_embed)
+    except:
+        pass
+
+@bot.command(name='renew-vps')
+@is_admin()
+async def renew_vps(ctx, container_name: str, additional_days: int = None):
+    """Renew VPS expiration date (admin only)"""
+    if additional_days is None:
+        additional_days = DEFAULT_VPS_EXPIRATION_DAYS
+    
+    if additional_days <= 0:
+        await ctx.send(embed=create_error_embed("Invalid Days", "Days must be a positive number."))
+        return
+    
+    found_vps = None
+    user_id = None
+    vps_index = None
+    
+    for uid, vps_list in vps_data.items():
+        for i, vps in enumerate(vps_list):
+            if vps['container_name'] == container_name:
+                found_vps = vps
+                user_id = uid
+                vps_index = i
+                break
+        if found_vps:
+            break
+    
+    if not found_vps:
+        await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS found with container name: `{container_name}`"))
+        return
+    
+    # Get current expiration or use today
+    if found_vps.get('expiration_date'):
+        current_expiration = datetime.fromisoformat(found_vps['expiration_date'])
+    else:
+        current_expiration = datetime.now()
+    
+    # Calculate new expiration date
+    new_expiration_date = (current_expiration + timedelta(days=additional_days)).isoformat()
+    found_vps['expiration_date'] = new_expiration_date
+    
+    # Unsuspend if it was suspended due to expiration
+    if found_vps.get('suspended', False):
+        found_vps['suspended'] = False
+    
+    vps_data[user_id][vps_index] = found_vps
+    save_vps_data()
+    
+    # Get owner info
+    try:
+        owner = await bot.fetch_user(int(user_id))
+        owner_mention = owner.mention
+    except:
+        owner_mention = f"User {user_id}"
+    
+    embed = create_success_embed("VPS Renewed", 
+        f"VPS `{container_name}` has been renewed")
+    add_field(embed, "Owner", owner_mention, True)
+    add_field(embed, "Added Days", str(additional_days), True)
+    add_field(embed, "Previous Expiration", current_expiration.strftime('%Y-%m-%d %H:%M:%S'), True)
+    add_field(embed, "New Expiration", datetime.fromisoformat(new_expiration_date).strftime('%Y-%m-%d %H:%M:%S'), True)
+    
+    await ctx.send(embed=embed)
+    
+    # Notify owner
+    try:
+        owner = await bot.fetch_user(int(user_id))
+        dm_embed = create_success_embed("✅ VPS Renewed",
+            f"Your VPS `{container_name}` has been renewed!\n\n"
+            f"**New Expiration:** {datetime.fromisoformat(new_expiration_date).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Thank you for using {BOT_NAME}!")
+        await owner.send(embed=dm_embed)
+    except:
+        pass
+
+@bot.command(name='vps-expiration')
+@is_admin()
+async def check_expiration(ctx, container_name: str = None):
+    """Check VPS expiration status (admin only)"""
+    if container_name:
+        # Check specific VPS
+        found_vps = None
+        user_id = None
+        
+        for uid, vps_list in vps_data.items():
+            for vps in vps_list:
+                if vps['container_name'] == container_name:
+                    found_vps = vps
+                    user_id = uid
+                    break
+            if found_vps:
+                break
+        
+        if not found_vps:
+            await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS found with container name: `{container_name}`"))
+            return
+        
+        # Get owner info
+        try:
+            owner = await bot.fetch_user(int(user_id))
+            owner_mention = owner.mention
+        except:
+            owner_mention = f"User {user_id}"
+        
+        embed = create_info_embed("VPS Expiration Status", f"Details for `{container_name}`")
+        add_field(embed, "Owner", owner_mention, True)
+        add_field(embed, "Container", f"`{container_name}`", True)
+        
+        if found_vps.get('expiration_date'):
+            expiration_dt = datetime.fromisoformat(found_vps['expiration_date'])
+            days_remaining = (expiration_dt - datetime.now()).days
+            
+            if days_remaining < 0:
+                status = "🔴 EXPIRED"
+                color = 0xff3366
+            elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                status = "🟡 EXPIRING SOON"
+                color = 0xffaa00
+            else:
+                status = "🟢 ACTIVE"
+                color = 0x00ff88
+            
+            embed.color = color
+            add_field(embed, "Status", status, True)
+            add_field(embed, "Expiration Date", expiration_dt.strftime('%Y-%m-%d %H:%M:%S'), True)
+            add_field(embed, "Days Remaining", str(max(0, days_remaining)), True)
+        else:
+            add_field(embed, "Status", "🔵 NO EXPIRATION SET", False)
+        
+        await ctx.send(embed=embed)
+    else:
+        # List all VPS with expiration status
+        embed = create_info_embed("📋 All VPS Expiration Status", "Global expiration overview")
+        
+        expiring_soon = []
+        expired = []
+        active = []
+        no_expiration = []
+        
+        for user_id, vps_list in vps_data.items():
+            try:
+                owner = await bot.fetch_user(int(user_id))
+                owner_name = owner.name
+            except:
+                owner_name = f"Unknown ({user_id})"
+            
+            for vps in vps_list:
+                if vps.get('expiration_date'):
+                    expiration_dt = datetime.fromisoformat(vps['expiration_date'])
+                    days_remaining = (expiration_dt - datetime.now()).days
+                    
+                    status_line = f"**{owner_name}** - `{vps['container_name']}`\n" \
+                                 f"Expires: {expiration_dt.strftime('%Y-%m-%d')} ({days_remaining} days)"
+                    
+                    if days_remaining < 0:
+                        expired.append(status_line)
+                    elif days_remaining <= EXPIRATION_WARNING_DAYS:
+                        expiring_soon.append(status_line)
+                    else:
+                        active.append(status_line)
+                else:
+                    no_expiration.append(f"**{owner_name}** - `{vps['container_name']}`")
+        
+        if expiring_soon:
+            add_field(embed, "🟡 Expiring Soon", "\n\n".join(expiring_soon), False)
+        if expired:
+            add_field(embed, "🔴 Expired", "\n\n".join(expired), False)
+        if active:
+            add_field(embed, "🟢 Active", "\n\n".join(active[:10]), False)
+            if len(active) > 10:
+                add_field(embed, "Note", f"Showing 10 of {len(active)} active VPS", False)
+        if no_expiration:
+            add_field(embed, "🔵 No Expiration Set", "\n".join(no_expiration[:5]), False)
+            if len(no_expiration) > 5:
+                add_field(embed, "Note", f"Total {len(no_expiration)} VPS without expiration date", False)
+        
+        await ctx.send(embed=embed)
 
 @bot.command(name='about')
 async def about(ctx):
@@ -3481,40 +5149,40 @@ async def quick_help(ctx):
     is_admin_user = user_id == str(MAIN_ADMIN_ID) or user_id in admin_data.get("admins", [])
     
     embed = create_info_embed("🚀 Quick Help Reference", 
-        "Quick reference for common tasks. Use `!help` for complete command list.")
+        f"Quick reference for common tasks. Use `{PREFIX}help` for complete command list.")
     
     # Common user tasks
     add_field(embed, "👤 For Users", 
-        "• `!myvps` - List your VPS\n"
-        "• `!manage` - Start/stop/manage VPS\n"
-        "• `!ports` - Manage port forwarding\n"
-        "• `!share-user @user 1` - Share VPS #1\n"
-        "• `!about` - Bot information", False)
+        f"• `{PREFIX}myvps` - List your VPS\n"
+        f"• `{PREFIX}manage` - Start/stop/manage VPS\n"
+        f"• `{PREFIX}ports` - Manage port forwarding\n"
+        f"• `{PREFIX}share-user @user 1` - Share VPS #1\n"
+        f"• `{PREFIX}about` - Bot information", False)
     
     # VPS management
     add_field(embed, "🖥️ VPS Control", 
-        "• In `!manage`: Click ▶ to start VPS\n"
-        "• In `!manage`: Click ⏸ to stop VPS\n"
-        "• In `!manage`: Click 🔑 for SSH access\n"
-        "• In `!manage`: Click 📊 for live stats\n"
-        "• In `!manage`: Click 🔄 to reinstall OS", False)
+        f"• In `{PREFIX}manage`: Click ▶ to start VPS\n"
+        f"• In `{PREFIX}manage`: Click ⏸ to stop VPS\n"
+        f"• In `{PREFIX}manage`: Click 🔑 for SSH access\n"
+        f"• In `{PREFIX}manage`: Click 📊 for live stats\n"
+        f"• In `{PREFIX}manage`: Click 🔄 to reinstall OS", False)
     
     # Troubleshooting
     add_field(embed, "🔧 Common Issues", 
-        "• Ports not working? Use `!repair-ports <container>` (admin)\n"
+        f"• Ports not working? Use `{PREFIX}repair-ports <container>` (admin)\n"
         "• VPS suspended? Contact admin to unsuspend\n"
         "• Need more resources? Contact admin for upgrade\n"
         "• SSH not working? Try reinstall with different OS", False)
     
     if is_admin_user:
         add_field(embed, "🛡️ Admin Quick Actions", 
-            "• `!create 2 2 20 @user` - Create 2GB/2CPU/20GB VPS\n"
-            "• `!userinfo @user` - Check user details\n"
-            "• `!node list` - List all nodes\n"
-            "• `!serverstats` - System overview\n"
-            "• `!suspend-vps <container> <reason>` - Suspend VPS", False)
+            f"• `{PREFIX}create 2 2 20 @user` - Create 2GB/2CPU/20GB VPS\n"
+            f"• `{PREFIX}userinfo @user` - Check user details\n"
+            f"• `{PREFIX}node list` - List all nodes\n"
+            f"• `{PREFIX}serverstats` - System overview\n"
+            f"• `{PREFIX}suspend-vps <container> <reason>` - Suspend VPS", False)
     
-    embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use !help for complete command list")
+    embed.set_footer(text=f"Made by Hopingboyz • Use {PREFIX}help for complete command list")
     await ctx.send(embed=embed)
 
 @bot.command(name='help-search')
@@ -3569,7 +5237,7 @@ async def help_search(ctx, *, search_term: str = None):
     if len(matches) > 15:
         add_field(embed, "Note", f"Showing 15 of {len(matches)} matches. Try a more specific search.", False)
     
-    embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use !help for complete list")
+    embed.set_footer(text=f"Made by Hopingboyz • Use {PREFIX}help for complete list")
     await ctx.send(embed=embed)    
 
 @bot.command(name='node')
@@ -3593,9 +5261,17 @@ async def node_cmd(ctx, sub: str, *args):
         tags_str = (await bot.wait_for('message', check=check)).content.strip()
         tags = [t.strip() for t in tags_str.split(',') if t.strip()]
         tags_json = json.dumps(tags)
-        await ctx.send("Enter node URL (e.g., http://ip:port) or leave blank for local:")
+        await ctx.send("Enter node URL (e.g., http://ip:port or https://ip:port) or leave blank for local:")
         url_str = (await bot.wait_for('message', check=check)).content.strip()
-        url = url_str if url_str else None
+        
+        # Normalize URL if provided
+        if url_str:
+            if not url_str.startswith('http://') and not url_str.startswith('https://'):
+                url_str = f'http://{url_str}'
+            url = url_str
+        else:
+            url = None
+        
         is_local = 1 if not url else 0
         api_key = None if is_local else ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
         conn = get_db()
@@ -3661,22 +5337,54 @@ async def node_cmd(ctx, sub: str, *args):
         new_tags = (await bot.wait_for('message', check=check)).content.strip()
         if new_tags != '.':
             node['tags'] = json.dumps([t.strip() for t in new_tags.split(',') if t.strip()])
-        if not node['is_local']:
-            await ctx.send("New URL ( . to skip):")
-            new_url = (await bot.wait_for('message', check=check)).content.strip()
-            if new_url != '.':
-                node['url'] = new_url
-            await ctx.send("Regenerate API key? (y/n):")
-            regen = (await bot.wait_for('message', check=check)).content.strip().lower()
-            if regen == 'y':
+        
+        # NEW: Add conversion option between Local and Dynamic
+        if node['is_local']:
+            await ctx.send("Convert Local Node to Dynamic URL-based Node? (y/n):")
+            convert = (await bot.wait_for('message', check=check)).content.strip().lower()
+            if convert == 'y':
+                await ctx.send("Enter node URL (e.g., http://ip:port or https://ip:port):")
+                url_str = (await bot.wait_for('message', check=check)).content.strip()
+                if not url_str:
+                    await ctx.send(embed=create_error_embed("Error", "URL cannot be empty for dynamic node."))
+                    return
+                
+                # Normalize URL - add http:// if not present
+                if not url_str.startswith('http://') and not url_str.startswith('https://'):
+                    url_str = f'http://{url_str}'
+                
+                node['url'] = url_str
+                node['is_local'] = 0
                 node['api_key'] = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+                await ctx.send(f"✅ Node converted to Dynamic!\n\n**URL:** `{url_str}`\n**Generated API Key:** `{node['api_key']}`\n\n**Setup Command:**\n```\npython node-agent.py --api_key={node['api_key']} --port=PORT\n```")
+        else:
+            await ctx.send("Convert Dynamic Node to Local? (y/n):")
+            convert = (await bot.wait_for('message', check=check)).content.strip().lower()
+            if convert == 'y':
+                node['url'] = None
+                node['api_key'] = None
+                node['is_local'] = 1
+                await ctx.send("✅ Node converted to Local!")
+            else:
+                await ctx.send("New URL ( . to skip):")
+                new_url = (await bot.wait_for('message', check=check)).content.strip()
+                if new_url != '.':
+                    # Normalize URL - add http:// if not present
+                    if not new_url.startswith('http://') and not new_url.startswith('https://'):
+                        new_url = f'http://{new_url}'
+                    node['url'] = new_url
+                await ctx.send("Regenerate API key? (y/n):")
+                regen = (await bot.wait_for('message', check=check)).content.strip().lower()
+                if regen == 'y':
+                    node['api_key'] = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+        
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('UPDATE nodes SET name=?, location=?, total_vps=?, tags=?, api_key=?, url=? WHERE id=?',
-                    (node['name'], node['location'], node['total_vps'], json.dumps(node['tags']), node.get('api_key'), node.get('url'), node_id))
+        cur.execute('UPDATE nodes SET name=?, location=?, total_vps=?, tags=?, api_key=?, url=?, is_local=? WHERE id=?',
+                    (node['name'], node['location'], node['total_vps'], json.dumps(node['tags']), node.get('api_key'), node.get('url'), node['is_local'], node_id))
         conn.commit()
         conn.close()
-        embed = create_success_embed("Node Updated", f"ID: {node_id}\nName: {node['name']}\nLocation: {node['location']}\nCapacity: {node['total_vps']}\nTags: {', '.join(node['tags'])}")
+        embed = create_success_embed("Node Updated", f"ID: {node_id}\nName: {node['name']}\nLocation: {node['location']}\nCapacity: {node['total_vps']}\nTags: {', '.join(node['tags'])}\nType: {'Local' if node['is_local'] else 'Dynamic'}")
         if not node['is_local']:
             add_field(embed, "API Key", node['api_key'], False)
             add_field(embed, "URL", node['url'], False)
@@ -3849,6 +5557,100 @@ async def node_cmd(ctx, sub: str, *args):
         
         await ctx.send(embed=embed)
     
+    elif sub == 'regen-key':
+        # NEW: Regenerate API key for dynamic node
+        if not args:
+            await ctx.send(embed=create_error_embed("Usage", f"{PREFIX}node regen-key <id>"))
+            return
+        
+        try:
+            node_id = int(args[0])
+        except ValueError:
+            await ctx.send(embed=create_error_embed("Invalid ID", "Node ID must be an integer."))
+            return
+        
+        node = get_node(node_id)
+        if not node:
+            await ctx.send(embed=create_error_embed("Not Found", "Node not found."))
+            return
+        
+        # Check if node is local
+        if node['is_local']:
+            await ctx.send(embed=create_error_embed("Error", "Cannot regenerate API key for Local nodes. Only Dynamic nodes have API keys."))
+            return
+        
+        # Confirm regeneration
+        warning_embed = create_warning_embed("⚠️ Regenerate API Key", 
+            f"You are about to regenerate the API key for node **{node['name']}**.\n\n"
+            f"**Current API Key:** `{node['api_key']}`\n\n"
+            f"**This action will:**\n"
+            f"• Generate a new 32-character API key\n"
+            f"• Invalidate the old API key\n"
+            f"• Require updating the remote node agent\n\n"
+            f"Are you sure you want to continue?")
+        
+        class ConfirmRegenKey(discord.ui.View):
+            def __init__(self, node_id, node):
+                super().__init__(timeout=60)
+                self.node_id = node_id
+                self.node = node
+            
+            @discord.ui.button(label="Regenerate Key", style=discord.ButtonStyle.danger)
+            async def confirm(self, inter: discord.Interaction, item: discord.ui.Button):
+                if str(inter.user.id) != str(ctx.author.id):
+                    await inter.response.send_message(
+                        embed=create_error_embed("Access Denied", "Only the command author can confirm."),
+                        ephemeral=True
+                    )
+                    return
+                
+                await inter.response.defer()
+                
+                # Generate new API key
+                new_api_key = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+                
+                # Update database
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute('UPDATE nodes SET api_key=? WHERE id=?', (new_api_key, self.node_id))
+                conn.commit()
+                conn.close()
+                
+                # Create success embed with new key
+                success_embed = create_success_embed("✅ API Key Regenerated", 
+                    f"Node **{self.node['name']}** (ID: {self.node_id})")
+                
+                add_field(success_embed, "Old API Key", f"`{self.node['api_key']}`", False)
+                add_field(success_embed, "New API Key", f"`{new_api_key}`", False)
+                add_field(success_embed, "Node URL", self.node['url'], True)
+                
+                setup_command = f"python node-agent.py --api_key={new_api_key} --port=PORT"
+                add_field(success_embed, "Update Remote Agent", 
+                    f"SSH to the remote server and restart with:\n```\n{setup_command}\n```", False)
+                
+                add_field(success_embed, "⚠️ Important", 
+                    "The old API key is now invalid. Update your remote node agent immediately.", False)
+                
+                await inter.followup.send(embed=success_embed)
+                self.stop()
+            
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self, inter: discord.Interaction, item: discord.ui.Button):
+                if str(inter.user.id) != str(ctx.author.id):
+                    await inter.response.send_message(
+                        embed=create_error_embed("Access Denied", "Only the command author can cancel."),
+                        ephemeral=True
+                    )
+                    return
+                
+                await inter.response.edit_message(
+                    embed=create_info_embed("Cancelled", "API key regeneration was cancelled."),
+                    view=None
+                )
+                self.stop()
+        
+        await ctx.send(embed=warning_embed, view=ConfirmRegenKey(node_id, node))
+    
     else:
         # Show help for node command
         embed = create_info_embed("Node Management", 
@@ -3877,16 +5679,16 @@ class HelpView(discord.ui.View):
                 "name": "🖥️ VPS Management",
                 "commands": [
                     (f"{PREFIX}myvps", "List your VPS"),
-                    (f"{PREFIX}vpsinfo [container]", "VPS information"),
-                    (f"{PREFIX}vps-stats <container>", "VPS stats"),
-                    (f"{PREFIX}vps-uptime <container>", "VPS uptime"),
-                    (f"{PREFIX}vps-processes <container>", "List processes"),
-                    (f"{PREFIX}vps-logs <container> [lines]", "Show logs"),
-                    (f"{PREFIX}restart-vps <container>", "Restart VPS"),
-                    (f"{PREFIX}clone-vps <container> [new_name]", "Clone VPS"),
-                    (f"{PREFIX}snapshot <container> [snap_name]", "Create snapshot"),
-                    (f"{PREFIX}list-snapshots <container>", "List snapshots"),
-                    (f"{PREFIX}restore-snapshot <container> <snap_name>", "Restore snapshot")
+                    (f"{PREFIX}vpsinfo [vps-id]", "Get VPS information by ID"),
+                    (f"{PREFIX}vps-stats <vps-id>", "Get VPS resource stats"),
+                    (f"{PREFIX}vps-uptime <vps-id>", "Get VPS uptime"),
+                    (f"{PREFIX}vps-processes <vps-id>", "List running processes in VPS"),
+                    (f"{PREFIX}vps-logs <vps-id> [lines]", "View VPS logs"),
+                    (f"{PREFIX}restart-vps <vps-id>", "Restart VPS"),
+                    (f"{PREFIX}clone-vps <vps-id> [new_name]", "Clone VPS by ID"),
+                    (f"{PREFIX}vps-password <vps-id>", "Get/reset VPS root password"),
+                    (f"{PREFIX}vps-network <vps-id>", "Show VPS network configuration"),
+                    (f"{PREFIX}status <vps-id>", "Get VPS status (running/stopped)")
                 ]
             },
             "ports": {
@@ -3915,7 +5717,8 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}node create", "Create a new node (Admin only)"),
                     (f"{PREFIX}node list", "List all nodes (Admin only)"),
                     (f"{PREFIX}node status <id>", "Check node status (Admin only)"),
-                    (f"{PREFIX}node edit <id>", "Edit node details (Admin only)"),
+                    (f"{PREFIX}node edit <id>", "Edit node details or convert Local↔Dynamic (Admin only)"),
+                    (f"{PREFIX}node regen-key <id>", "Regenerate API key for Dynamic node (Admin only)"),
                     (f"{PREFIX}node delete <id>", "Delete a node (Admin only)"),
                     (f"{PREFIX}node migrate <from> <to>", "Migrate VPS between nodes (Admin only)"),
                     (f"{PREFIX}lxc-list [node_id]", "List LXC containers on node (Admin only)")
@@ -3935,21 +5738,47 @@ class HelpView(discord.ui.View):
                 "name": "🛡️ Admin Commands",
                 "commands": [
                     (f"{PREFIX}lxc-list", "List all LXC containers"),
-                    (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user", "Create VPS with OS selection"),
-                    (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
-                    (f"{PREFIX}add-resources <container> [ram] [cpu] [disk]", "Add resources to VPS"),
-                    (f"{PREFIX}resize-vps <container> [ram] [cpu] [disk]", "Resize VPS resources"),
-                    (f"{PREFIX}suspend-vps <container> [reason]", "Suspend VPS"),
-                    (f"{PREFIX}unsuspend-vps <container>", "Unsuspend VPS"),
-                    (f"{PREFIX}suspension-logs [container]", "View suspension logs"),
-                    (f"{PREFIX}whitelist-vps <container> <add|remove>", "Whitelist VPS from auto-suspend"),
+                    (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user [expiry_days]", "Create VPS with OS selection (optional expiry in days)"),
+                    (f"{PREFIX}delete-vps @user <vps-id> [reason]", "Delete user's VPS by ID"),
+                    (f"{PREFIX}add-resources <vps-id> [ram] [cpu] [disk]", "Add resources to VPS"),
+                    (f"{PREFIX}resize-vps <vps-id> [ram] [cpu] [disk]", "Resize VPS resources"),
+                    (f"{PREFIX}suspend-vps <vps-id> [reason]", "Suspend VPS by ID"),
+                    (f"{PREFIX}unsuspend-vps <vps-id>", "Unsuspend VPS by ID"),
+                    (f"{PREFIX}suspension-logs [vps-id]", "View suspension logs"),
+                    (f"{PREFIX}whitelist-vps <vps-id> <add|remove>", "Whitelist VPS from auto-suspend"),
                     (f"{PREFIX}userinfo @user", "User information"),
                     (f"{PREFIX}list-all", "List all VPS"),
-                    (f"{PREFIX}exec <container> <command>", "Execute command"),
-                    (f"{PREFIX}stop-vps-all", "Stop all VPS"),
-                    (f"{PREFIX}migrate-vps <container> <pool>", "Migrate VPS"),
-                    (f"{PREFIX}vps-network <container> <action> [value]", "Network management"),
-                    (f"{PREFIX}apply-permissions <container>", "Apply Docker-ready permissions")
+                    (f"{PREFIX}exec <vps-id> <command>", "Execute command in VPS"),
+                    (f"{PREFIX}stop-vps-all", "Stop all VPS on system"),
+                    (f"{PREFIX}migrate-vps <vps-id> <pool>", "Migrate VPS to different storage pool"),
+                    (f"{PREFIX}vps-network <vps-id> <action> [value]", "Network management and configuration"),
+                    (f"{PREFIX}apply-permissions <vps-id>", "Apply Docker-ready permissions to VPS"),
+                    (f"{PREFIX}vps-password <vps-id>", "Get/reset VPS password by ID"),
+                    (f"{PREFIX}node-check <node_id>", "Check node health and status"),
+                    (f"{PREFIX}status <vps-id>", "Get VPS status"),
+                    (f"{PREFIX}status-summary", "Get summary of all VPS status"),
+                    (f"{PREFIX}repair-ports", "Repair port forwarding configuration"),
+                    (f"{PREFIX}resource-check", "Check and suspend high-usage VPS")
+                ],
+                "admin_only": True
+            },
+            "expiration": {
+                "name": "⏰ VPS Expiration",
+                "commands": [
+                    (f"{PREFIX}set-expiration <vps-id> <days>", "Set VPS expiration date (Admin only)"),
+                    (f"{PREFIX}renew-vps <vps-id> [days]", "Renew VPS expiration (Admin only)"),
+                    (f"{PREFIX}vps-expiration [vps-id]", "Check VPS expiration status (Admin only)")
+                ],
+                "admin_only": True
+            },
+            "maintenance": {
+                "name": "🔧 Maintenance & Monitoring",
+                "commands": [
+                    (f"{PREFIX}cpu-monitor <status|enable|disable>", "Resource monitor control (logging only)"),
+                    (f"{PREFIX}backup-db", "Backup VPS database (Admin only)"),
+                    (f"{PREFIX}repair-ports", "Repair port forwarding configuration (Admin only)"),
+                    (f"{PREFIX}node-check <node_id>", "Check node health and status (Admin only)"),
+                    (f"{PREFIX}resource-check", "Check and suspend high-usage VPS (Admin only)")
                 ],
                 "admin_only": True
             },
@@ -4001,6 +5830,16 @@ class HelpView(discord.ui.View):
                 value="admin",
                 emoji=self.get_category_emoji("admin")
             ))
+            options.append(discord.SelectOption(
+                label=self.command_categories["expiration"]["name"],
+                value="expiration",
+                emoji=self.get_category_emoji("expiration")
+            ))
+            options.append(discord.SelectOption(
+                label=self.command_categories["maintenance"]["name"],
+                value="maintenance",
+                emoji=self.get_category_emoji("maintenance")
+            ))
        
         if is_main_admin_user:
             options.append(discord.SelectOption(
@@ -4032,6 +5871,8 @@ class HelpView(discord.ui.View):
             "bot": "🤖",
             "nodes": "🌐",
             "admin": "🛡️",
+            "expiration": "⏰",
+            "maintenance": "🔧",
             "main_admin": "👑"
         }
         return emojis.get(category, "📁")
@@ -4048,6 +5889,8 @@ class HelpView(discord.ui.View):
             "bot": 0x9b59b6, # Purple
             "nodes": 0x1abc9c, # Teal
             "admin": 0xe67e22, # Carrot
+            "expiration": 0xff6b6b, # Coral red for expiration
+            "maintenance": 0x34495e, # Dark gray for maintenance
             "main_admin": 0xf1c40f # Yellow
         }
         color = colors.get(self.current_category, 0x1a1a1a)
@@ -4057,12 +5900,14 @@ class HelpView(discord.ui.View):
        
         # Add helpful tips based on category
         tips = {
-            "user": "Tip: Use `!myvps` to see all your VPS and `!manage` to control them.",
-            "vps": "Tip: Snapshots are useful before making major changes to your VPS.",
+            "user": f"Tip: Use `{PREFIX}myvps` to see all your VPS and `{PREFIX}manage` to control them.",
+            "vps": f"Tip: Use `{PREFIX}manage` to control your VPS from Discord.",
             "ports": "Tip: Port forwards work for both TCP and UDP protocols.",
             "system": "Tip: Set thresholds to monitor resource usage across nodes.",
-            "nodes": "Tip: Use `!node list` to see all available nodes and their status.",
-            "admin": "Tip: Always check `!userinfo @user` before modifying VPS.",
+            "nodes": f"Tip: Use `{PREFIX}node list` to see all available nodes and their status.",
+            "admin": f"Tip: Always check `{PREFIX}userinfo @user` before modifying VPS.",
+            "expiration": "Tip: VPS are automatically suspended when they expire. Renew them to unsuspend.",
+            "maintenance": f"Tip: Use `{PREFIX}backup-db` regularly to backup your VPS database.",
             "main_admin": "Tip: Be careful when adding/removing admin privileges."
         }
        
@@ -4078,12 +5923,14 @@ class HelpView(discord.ui.View):
         # Add appropriate footer based on category
         footers = {
             "user": f"{BOT_NAME} VPS Manager • User Commands • Need help? Contact admin",
-            "vps": f"{BOT_NAME} VPS Manager • VPS Management • Snapshots • Cloning",
+            "vps": f"{BOT_NAME} VPS Manager • VPS Management • Cloning",
             "ports": f"{BOT_NAME} VPS Manager • Port Forwarding • TCP/UDP Support",
             "system": f"{BOT_NAME} VPS Manager • System Monitoring • Resource Management",
             "nodes": f"{BOT_NAME} VPS Manager • Multi-Node Management • Distributed Infrastructure",
             "bot": f"{BOT_NAME} VPS Manager • Bot Control • Status Management",
             "admin": f"{BOT_NAME} VPS Manager • Admin Panel • Restricted Access",
+            "expiration": f"{BOT_NAME} VPS Manager • VPS Expiration • Auto-Suspension",
+            "maintenance": f"{BOT_NAME} VPS Manager • System Maintenance • Database Backup & Repair",
             "main_admin": f"{BOT_NAME} VPS Manager • Main Admin • Full System Control"
         }
        
@@ -4126,9 +5973,297 @@ async def info_alias(ctx, user: discord.Member = None):
             await ctx.send(embed=create_error_embed("Usage", f"Please specify a user: `{PREFIX}info @user`"))
     else:
         await ctx.send(embed=create_error_embed("Access Denied", "This command requires admin privileges."))
+
+# ═══════════════════════════════════════════════════════════════════
+# !deploy — Self-service VPS deployment
+# ═══════════════════════════════════════════════════════════════════
+
+# Track in-flight deploys to prevent duplicate submissions
+_deploying_users: set = set()
+
+
+class DeployOSView(discord.ui.View):
+    """OS selection dropdown shown after the user clicks Create in !deploy."""
+    def __init__(self, user: discord.Member, ctx, node_id: int):
+        super().__init__(timeout=120)
+        self.user = user
+        self.ctx = ctx
+        self.node_id = node_id
+        options = [discord.SelectOption(label=o["label"], value=o["value"]) for o in OS_OPTIONS]
+        self.select = discord.ui.Select(placeholder="Select OS for your VPS", options=options)
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != str(self.user.id):
+            await interaction.response.send_message(
+                embed=create_error_embed("Access Denied", "Only you can select the OS."), ephemeral=True)
+            return
+        os_value = self.select.values[0]
+        os_label = next((o["label"] for o in OS_OPTIONS if o["value"] == os_value), os_value)
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            embed=create_info_embed("🚀 Deploying VPS", f"Deploying **{os_label}**… this takes 1-3 minutes."))
+        try:
+            await _do_free_deploy(self.ctx, self.user, os_value, self.node_id)
+        finally:
+            _deploying_users.discard(str(self.user.id))
+
+    async def on_timeout(self):
+        _deploying_users.discard(str(self.user.id))
+
+
+class DeployConfirmView(discord.ui.View):
+    """Confirm/Cancel buttons shown by !deploy with resource info."""
+    def __init__(self, user: discord.Member, ctx, node_id: int):
+        super().__init__(timeout=120)
+        self.user = user
+        self.ctx = ctx
+        self.node_id = node_id
+
+    async def _check_author(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != str(self.user.id):
+            await interaction.response.send_message(
+                embed=create_error_embed("Access Denied", "Only you can confirm this."), ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Create VPS", style=discord.ButtonStyle.success)
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_author(interaction):
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        os_embed = create_info_embed("💿 Select OS", "Choose the operating system for your VPS:")
+        os_view = DeployOSView(self.user, self.ctx, self.node_id)
+        await interaction.followup.send(embed=os_embed, view=os_view)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_author(interaction):
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(embed=create_info_embed("Cancelled", "VPS deployment cancelled."))
+        _deploying_users.discard(str(self.user.id))
+
+    async def on_timeout(self):
+        _deploying_users.discard(str(self.user.id))
+
+
+async def _do_free_deploy(ctx, user: discord.Member, os_version: str, node_id: int):
+    """Core deploy logic for !deploy command."""
+    user_id = str(user.id)
+    try:
+        sanitized = sanitize_username_for_container(user.name.lower()[:15])
+        ram_mb = DEPLOY_RAM * 1024
+        # Generate container name using global VPS ID (same pattern as !create)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(id) FROM vps")
+        max_id = cur.fetchone()[0] or 0
+        global_vps_id = max_id + 1
+        conn.close()
+        container_name = f"{sanitized}-vps-{global_vps_id}"
+        await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL} -c security.privileged=true", node_id=node_id)
+        await execute_lxc(container_name, f"config set {container_name} limits.memory {ram_mb}MB", node_id=node_id)
+        await execute_lxc(container_name, f"config set {container_name} limits.cpu {DEPLOY_CPU}", node_id=node_id)
+        await execute_lxc(container_name, f"config device set {container_name} root size={DEPLOY_DISK}GB", node_id=node_id)
+        await apply_lxc_config(container_name, node_id)
+        await execute_lxc(container_name, f"start {container_name}", node_id=node_id)
+        await apply_internal_permissions(container_name, node_id)
+
+        root_password = generate_strong_password()
+        await configure_ssh(container_name, node_id, root_password)
+
+        ssh_host_port = None
+        try:
+            ssh_host_port = await create_port_forward(user_id, container_name, 22, node_id)
+        except Exception as e:
+            logger.warning(f"Deploy SSH port forward failed: {e}")
+
+        if HOST_MOTD:
+            try:
+                await execute_lxc(container_name, f'exec {container_name} -- bash -c "{HOST_MOTD}"', node_id=node_id)
+            except Exception:
+                pass
+
+        config_str = f"{DEPLOY_RAM}GB RAM / {DEPLOY_CPU} CPU / {DEPLOY_DISK}GB Disk"
+        expiration_date = (datetime.now() + timedelta(days=DEFAULT_VPS_EXPIRATION_DAYS)).isoformat()
+        vps_info = {
+            "container_name": container_name,
+            "node_id": node_id,
+            "ram": f"{DEPLOY_RAM}GB",
+            "cpu": str(DEPLOY_CPU),
+            "storage": f"{DEPLOY_DISK}GB",
+            "config": config_str,
+            "os_version": os_version,
+            "status": "running",
+            "suspended": False,
+            "whitelisted": False,
+            "suspension_history": [],
+            "created_at": datetime.now().isoformat(),
+            "shared_with": [],
+            "expiration_date": expiration_date,
+            "root_password": root_password,
+        }
+        if user_id not in vps_data:
+            vps_data[user_id] = []
+        vps_data[user_id].append(vps_info)
+        save_vps_data_immediate()
+
+        if ctx.guild:
+            vps_role = await get_or_create_vps_role(ctx.guild)
+            if vps_role:
+                try:
+                    await user.add_roles(vps_role, reason="VPS deployed via !deploy")
+                except discord.Forbidden:
+                    pass
+
+        # DM credentials to user
+        dm_embed = create_success_embed("🎉 VPS Deployed!", "Your free VPS is ready!")
+        dm_embed.add_field(name="📊 Details", value=(
+            f"**Container:** `{container_name}`\n"
+            f"**OS:** {os_version}\n"
+            f"**Config:** {config_str}\n"
+            f"**Expires:** {(datetime.now() + timedelta(days=DEFAULT_VPS_EXPIRATION_DAYS)).strftime('%Y-%m-%d')}"
+        ), inline=False)
+
+        ssh_info = ""
+        if ssh_host_port:
+            # Main VPS public IP + forwarded port → connects to container SSH
+            ssh_info += (
+                f"**SSH Command:**\n"
+                f"`ssh root@{YOUR_SERVER_IP} -p {ssh_host_port}`\n\n"
+                f"*(Port {ssh_host_port} on host `{YOUR_SERVER_IP}` is forwarded to your container)*\n\n"
+            )
+        else:
+            ssh_info += (
+                f"⚠️ **Port forward could not be set up automatically.**\n"
+                f"Contact an admin to manually assign a port.\n\n"
+            )
+        ssh_info += f"**Username:** `root`\n**Password:** `{root_password}`\n\n🔒 Save this password — it won't be shown again!"
+        dm_embed.add_field(name="🔐 SSH Access", value=ssh_info, inline=False)
+
+        try:
+            await user.send(embed=dm_embed)
+        except discord.Forbidden:
+            pass
+
+        node = get_node(node_id)
+        pub_embed = create_success_embed("✅ VPS Deployed!", f"{user.mention} your VPS is ready! Check your **DMs** for SSH credentials.")
+        pub_embed.add_field(name="Container", value=f"`{container_name}`", inline=True)
+        pub_embed.add_field(name="OS", value=os_version, inline=True)
+        pub_embed.add_field(name="Node", value=node['name'] if node else "Unknown", inline=True)
+        if ssh_host_port:
+            pub_embed.add_field(
+                name="🌐 SSH",
+                value=f"`ssh root@{YOUR_SERVER_IP} -p {ssh_host_port}`",
+                inline=False
+            )
+        await ctx.send(embed=pub_embed)
+
+    except Exception as e:
+        logger.error(f"!deploy failed for {user}: {e}")
+        await ctx.send(embed=create_error_embed("Deploy Failed", str(e)))
+        _deploying_users.discard(str(user.id))
+
+
+def get_slot_stats_deploy():
+    total = running = suspended = stopped = expired = 0
+    now = datetime.now()
+    for user_vps_list in vps_data.values():
+        for vps in user_vps_list:
+            total += 1
+            exp = vps.get('expiration_date')
+            if exp and datetime.fromisoformat(exp) < now:
+                expired += 1
+            if vps.get('suspended'):
+                suspended += 1
+            elif vps.get('status') == 'running':
+                running += 1
+            else:
+                stopped += 1
+    return total, running, suspended, stopped, expired
+
+
+@bot.command(name='deploy')
+async def deploy_cmd(ctx):
+    """Self-service VPS deployment for members with the deploy role."""
+    user_id = str(ctx.author.id)
+
+    # Check if deploy is configured
+    if DEPLOY_ROLE_ID == 0:
+        await ctx.send(embed=create_error_embed("Not Configured", "Self-service deploy is not enabled. Contact an admin."))
+        return
+
+    # Check role
+    role_ids = [r.id for r in ctx.author.roles]
+    if DEPLOY_ROLE_ID not in role_ids and str(ctx.author.id) != str(MAIN_ADMIN_ID):
+        await ctx.send(embed=create_error_embed("Access Denied", "You don't have the required role to deploy a VPS."))
+        return
+
+    # Prevent duplicate in-flight deploys
+    if user_id in _deploying_users:
+        await ctx.send(embed=create_error_embed("Already Deploying", "You already have a deployment in progress. Please wait."))
+        return
+
+    # Check per-user VPS_DEPLOY_LIMIT (counts ALL VPS owned by user, including admin-given ones)
+    user_vps = vps_data.get(user_id, [])
+    if DEPLOY_LIMIT > 0 and len(user_vps) >= DEPLOY_LIMIT:
+        await ctx.send(embed=create_error_embed(
+            "Limit Reached",
+            f"You already have **{len(user_vps)}/{DEPLOY_LIMIT}** VPS. You cannot create more.\n"
+            f"Contact an admin if you need more resources."
+        ))
+        return
+
+    # Check global slot cap
+    total, running, suspended, stopped, expired = get_slot_stats_deploy()
+    if DEPLOY_SLOT > 0 and total >= DEPLOY_SLOT:
+        await ctx.send(embed=create_error_embed("No Slots Available", f"All {DEPLOY_SLOT} VPS slots are currently full. Try again later."))
+        return
+
+    # Pick an available node
+    nodes = get_nodes()
+    available_nodes = [n for n in nodes if get_current_vps_count(n['id']) < n['total_vps']]
+    if not available_nodes:
+        await ctx.send(embed=create_error_embed("No Nodes Available", "All nodes are full. Contact an admin."))
+        return
+    node_id = available_nodes[0]['id']
+
+    _deploying_users.add(user_id)
+
+    if DEPLOY_SLOT > 0:
+        slot_line = f"\n> 🎰 **Slots:** `{total}/{DEPLOY_SLOT}` used"
+    else:
+        slot_line = f"\n> 📊 **Total VPS:** `{total}`"
+    embed = create_info_embed(
+        "🚀 Deploy Free VPS",
+        f"> **RAM:** `{DEPLOY_RAM}GB`\n"
+        f"> **CPU:** `{DEPLOY_CPU}` Cores\n"
+        f"> **Disk:** `{DEPLOY_DISK}GB`{slot_line}\n\n"
+        f"Click **✅ Create VPS** to choose your OS and deploy!"
+    )
+    view = DeployConfirmView(ctx.author, ctx, node_id)
+    await ctx.send(embed=embed, view=view)
+
+
+
 # Run the bot
 if __name__ == "__main__":
-    if DISCORD_TOKEN:
+    if not DISCORD_TOKEN or DISCORD_TOKEN == 'your_discord_bot_token_here':
+        logger.error("❌ ERROR: No valid Discord token found!")
+        logger.error("Please update your .env file with a valid Discord bot token.")
+        logger.error("DISCORD_TOKEN in .env is currently set to: " + str(DISCORD_TOKEN))
+        exit(1)
+    try:
         bot.run(DISCORD_TOKEN)
-    else:
-        logger.error("No Discord token found in DISCORD_TOKEN environment variable.")
+    except discord.errors.LoginFailure as e:
+        logger.error(f"❌ ERROR: Failed to login with Discord token: {e}")
+        logger.error("Please check your DISCORD_TOKEN in the .env file.")
+        exit(1)
