@@ -857,7 +857,11 @@ async def apply_lxc_config(container_name: str, node_id: int):
         await execute_lxc(container_name, f"config set {container_name} security.privileged true", node_id=node_id)
         await execute_lxc(container_name, f"config set {container_name} security.syscalls.intercept.mknod true", node_id=node_id)
         await execute_lxc(container_name, f"config set {container_name} security.syscalls.intercept.setxattr true", node_id=node_id)
-        await execute_lxc(container_name, f"config set {container_name} linux.kernel_modules overlay,loop,nf_nat,ip_tables,ip6_tables,br_netfilter", node_id=node_id)
+        await execute_lxc(container_name, f"config set {container_name} linux.kernel_modules overlay,loop,nf_nat,ip_tables,ip6_tables,netlink_diag,br_netfilter", node_id=node_id)
+        try:
+            await execute_lxc(container_name, f"config device add {container_name} fuse unix-char path=/dev/fuse", node_id=node_id)
+        except:
+            pass
         raw_lxc_config = (
             "lxc.apparmor.profile = unconfined\n"
             "lxc.apparmor.allow_nesting = 1\n"
@@ -868,30 +872,10 @@ async def apply_lxc_config(container_name: str, node_id: int):
             "lxc.cgroup2.devices.allow = a\n"
             "\n"
             "lxc.mount.auto = proc:rw sys:rw cgroup:rw shmounts:rw\n"
+            "\n"
+            "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n"
         )
-        # Use stdin pipe to set raw.lxc — avoids shlex.split() mangling the
-        # multiline value when it's embedded directly in the command string.
-        node = get_node(node_id)
-        if node and node['is_local']:
-            proc = await asyncio.create_subprocess_exec(
-                "lxc", "config", "set", container_name, "raw.lxc", "-",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=raw_lxc_config.encode()), timeout=30
-            )
-            if proc.returncode != 0:
-                raise Exception(f"Failed to set raw.lxc: {stderr.decode().strip()}")
-        else:
-            # Remote node: send as a single-line escaped value via the existing API
-            escaped = raw_lxc_config.replace("\n", "\\n")
-            await execute_lxc(
-                container_name,
-                f"config set {container_name} raw.lxc {escaped!r}",
-                node_id=node_id,
-            )
+        await execute_lxc(container_name, f"config set {container_name} raw.lxc '{raw_lxc_config}'", node_id=node_id)
         logger.info(f"LXC permissions applied to {container_name} on node {node_id}")
     except Exception as e:
         logger.error(f"Failed to apply LXC config to {container_name}: {e}")
@@ -1760,7 +1744,7 @@ class OSSelectView(discord.ui.View):
         container_name = f"{sanitized_username}-vps-{global_vps_id}"
         ram_mb = self.ram * 1024
         try:
-            await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL} -c security.privileged=true", node_id=self.node_id)
+            await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL}", node_id=self.node_id)
             await execute_lxc(container_name, f"config set {container_name} limits.memory {ram_mb}MB", node_id=self.node_id)
             await execute_lxc(container_name, f"config set {container_name} limits.cpu {self.cpu}", node_id=self.node_id)
             await execute_lxc(container_name, f"config device set {container_name} root size={self.disk}GB", node_id=self.node_id)
@@ -1943,7 +1927,7 @@ class ReinstallOSSelectView(discord.ui.View):
         
         try:
             # No need to delete again; already deleted in confirmation
-            await execute_lxc(self.container_name, f"init {os_version} {self.container_name} -s {DEFAULT_STORAGE_POOL} -c security.privileged=true", node_id=self.node_id)
+            await execute_lxc(self.container_name, f"init {os_version} {self.container_name} -s {DEFAULT_STORAGE_POOL}", node_id=self.node_id)
             await execute_lxc(self.container_name, f"config set {self.container_name} limits.memory {ram_mb}MB", node_id=self.node_id)
             await execute_lxc(self.container_name, f"config set {self.container_name} limits.cpu {self.cpu}", node_id=self.node_id)
             await execute_lxc(self.container_name, f"config device set {self.container_name} root size={self.storage_gb}GB", node_id=self.node_id)
@@ -6069,7 +6053,7 @@ async def _do_free_deploy(ctx, user: discord.Member, os_version: str, node_id: i
         global_vps_id = max_id + 1
         conn.close()
         container_name = f"{sanitized}-vps-{global_vps_id}"
-        await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL} -c security.privileged=true", node_id=node_id)
+        await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL}", node_id=node_id)
         await execute_lxc(container_name, f"config set {container_name} limits.memory {ram_mb}MB", node_id=node_id)
         await execute_lxc(container_name, f"config set {container_name} limits.cpu {DEPLOY_CPU}", node_id=node_id)
         await execute_lxc(container_name, f"config device set {container_name} root size={DEPLOY_DISK}GB", node_id=node_id)
